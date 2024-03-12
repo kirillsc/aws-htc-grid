@@ -62,14 +62,14 @@ module "cancel_tasks" {
         "!LICENSE*",
       ]
     },
-    {
-      path = "../../../source/client/python/utils/"
-      patterns = [
-        "!README\\.md",
-        "!setup\\.py",
-        "!LICENSE*",
-      ]
-    },
+    # {
+    #   path = "../../../source/client/python/utils/"
+    #   patterns = [
+    #     "!README\\.md",
+    #     "!setup\\.py",
+    #     "!LICENSE*",
+    #   ]
+    # },
     {
       pip_requirements = "../../../source/control_plane/python/lambda/cancel_tasks/requirements.txt"
     }

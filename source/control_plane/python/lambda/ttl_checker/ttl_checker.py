@@ -10,10 +10,10 @@ from datetime import datetime, timedelta
 
 from botocore.exceptions import ClientError
 
-from utils.performance_tracker import EventsCounter, performance_tracker_initializer
-from utils import grid_error_logger as errlog
+from htcutils.performance_tracker import EventsCounter, performance_tracker_initializer
+from htcutils import grid_error_logger as errlog
 
-from utils.state_table_common import (
+from htcutils.state_table_common import (
     TASK_STATE_RETRYING,
     TASK_STATE_INCONSISTENT,
     TASK_STATE_FAILED,

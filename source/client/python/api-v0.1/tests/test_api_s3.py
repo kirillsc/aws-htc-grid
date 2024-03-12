@@ -22,7 +22,7 @@ responses = Responses("requests.packages.urllib3")
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from api.connector import AWSConnector  # noqa: E402
-from utils.state_table_common import TASK_STATE_FINISHED  # noqa: E402
+from htcutils.state_table_common import TASK_STATE_FINISHED  # noqa: E402
 
 
 @pytest.fixture

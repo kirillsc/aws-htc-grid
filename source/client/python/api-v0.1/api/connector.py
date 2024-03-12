@@ -12,7 +12,7 @@ import requests
 import logging
 
 from api.in_out_manager import in_out_manager
-from utils.state_table_common import TASK_STATE_FINISHED
+from htcutils.state_table_common import TASK_STATE_FINISHED
 from warrant_lite import WarrantLite
 from apscheduler.schedulers.background import BackgroundScheduler
 

@@ -62,14 +62,14 @@ module "get_results" {
         "!LICENSE*",
       ]
     },
-    {
-      path = "../../../source/client/python/utils/"
-      patterns = [
-        "!README\\.md",
-        "!setup\\.py",
-        "!LICENSE*",
-      ]
-    },
+    # {
+    #   path = "../../../source/client/python/utils/"
+    #   patterns = [
+    #     "!README\\.md",
+    #     "!setup\\.py",
+    #     "!LICENSE*",
+    #   ]
+    # },
     {
       pip_requirements = "../../../source/control_plane/python/lambda/get_results/requirements.txt"
     }

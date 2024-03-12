@@ -4,7 +4,7 @@
 
 from api.connector import AWSConnector
 
-from utils.mock_compute_engine_job_wrapper import MockComputeEngineJobWrapper as JW
+from htcutils.mock_compute_engine_job_wrapper import MockComputeEngineJobWrapper as JW
 
 import timeit
 import argparse

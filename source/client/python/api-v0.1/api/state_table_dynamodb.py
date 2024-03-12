@@ -15,14 +15,14 @@ import random
 import traceback
 
 
-from utils.state_table_common import (
+from htcutils.state_table_common import (
     TASK_STATE_CANCELLED,
     TASK_STATE_PENDING,
     TASK_STATE_FAILED,
     TASK_STATE_PROCESSING,
     TASK_STATE_FINISHED,
 )
-from utils.state_table_common import StateTableException
+from htcutils.state_table_common import StateTableException
 
 
 logging.basicConfig(

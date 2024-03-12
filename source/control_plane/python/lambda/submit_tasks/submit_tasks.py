@@ -13,12 +13,12 @@ import copy
 
 from botocore.exceptions import ClientError
 
-from utils.performance_tracker import EventsCounter, performance_tracker_initializer
+from htcutils.performance_tracker import EventsCounter, performance_tracker_initializer
 
 from boto3.dynamodb.conditions import Key
 
-import utils.grid_error_logger as errlog
-from utils.state_table_common import TASK_STATE_PENDING
+import htcutils.grid_error_logger as errlog
+from htcutils.state_table_common import TASK_STATE_PENDING
 
 from api.in_out_manager import in_out_manager
 from api.queue_manager import queue_manager

@@ -10,15 +10,15 @@ import traceback
 
 from botocore.exceptions import ClientError
 
-from utils.performance_tracker import EventsCounter, performance_tracker_initializer
+from htcutils.performance_tracker import EventsCounter, performance_tracker_initializer
 from api.state_table_manager import state_table_manager
-from utils.state_table_common import (
+from htcutils.state_table_common import (
     TASK_STATE_CANCELLED,
     TASK_STATE_FAILED,
     TASK_STATE_FINISHED,
 )
 
-import utils.grid_error_logger as errlog
+import htcutils.grid_error_logger as errlog
 
 state_table = state_table_manager(
     os.environ["STATE_TABLE_SERVICE"],

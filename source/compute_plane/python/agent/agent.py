@@ -25,11 +25,11 @@ from aws_xray_sdk import global_sdk_config
 from botocore.exceptions import ClientError
 from api.in_out_manager import in_out_manager
 from api.queue_manager import queue_manager
-from utils.performance_tracker import EventsCounter, performance_tracker_initializer
-from utils.state_table_common import TASK_STATE_CANCELLED, StateTableException
+from htcutils.performance_tracker import EventsCounter, performance_tracker_initializer
+from htcutils.state_table_common import TASK_STATE_CANCELLED, StateTableException
 from api.state_table_manager import state_table_manager
-from utils.ttl_experation_generator import TTLExpirationGenerator
-import utils.grid_error_logger as errlog
+from htcutils.ttl_experation_generator import TTLExpirationGenerator
+import htcutils.grid_error_logger as errlog
 
 # Uncomment to get tracing on interruption
 # import faulthandler
@@ -333,7 +333,7 @@ def process_subprocess_completion(
     This function is responsible for updating the dynamoDB item associated to the input task with the ouput of the
     execution
     Args:
-        perf_tracker (utils.performance_tracker.PerformanceTracker): endpoint for sending metrics
+        perf_tracker (htcutils.performance_tracker.PerformanceTracker): endpoint for sending metrics
         task (dict): the task that went to completion
         sqs_msg (Message): the SQS message associated to the completed task
         fname_stdout (file): the file  where stdout was redirected

@@ -23,9 +23,9 @@ BUILD_TYPE?=Release
 PACKAGE_DIR := ./dist
 PYTHON_PACKAGE_DIR := ./dist/python
 PACKAGES    := $(wildcard $(PYTHON_PACKAGE_DIR)/*.whl)
-.PHONY: all utils api lambda submitter  packages test test-api test-utils test-agent lambda-init config-c++
+.PHONY: all api lambda submitter  packages test test-api test-agent lambda-init config-c++
 
-all: utils api lambda submitter lambda-init k8s-jobs
+all: api lambda submitter lambda-init k8s-jobs
 
 
 
@@ -166,10 +166,12 @@ http-apis:
 	$(MAKE) -C ./source/control_plane/openapi/ all
 
 utils:
-	$(MAKE) -C ./source/client/python/utils
+	echo "SKIP"
+#	$(MAKE) -C ./source/client/python/utils
 
-install-utils: utils
-	pip install --force-reinstall $(PYTHON_PACKAGE_DIR)/utils-*.whl
+install-utils:
+	pip install htcutils
+# pip install --force-reinstall $(PYTHON_PACKAGE_DIR)/utils-*.whl
 
 test-utils:
 	$(MAKE) test -C ./source/client/python/utils

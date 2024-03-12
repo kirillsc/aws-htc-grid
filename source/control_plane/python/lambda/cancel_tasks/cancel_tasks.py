@@ -9,9 +9,9 @@ import base64
 import os
 import traceback
 
-import utils.grid_error_logger as errlog
+import htcutils.grid_error_logger as errlog
 
-from utils.state_table_common import (
+from htcutils.state_table_common import (
     TASK_STATE_PENDING,
     TASK_STATE_PROCESSING,
     StateTableException,

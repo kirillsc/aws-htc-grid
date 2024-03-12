@@ -6,9 +6,9 @@ import boto3
 import logging
 import traceback
 
-from utils.task_queue_common import TaskQueueException
+from htcutils.task_queue_common import TaskQueueException
 
-from utils import grid_error_logger as errlog
+from htcutils import grid_error_logger as errlog
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(filename)s - %(funcName)s  - %(lineno)d - %(message)s",
