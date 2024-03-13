@@ -163,14 +163,15 @@ get-agent-configuration: ./deployment/grid/terraform
 ##### Building source #######
 #############################
 http-apis:
-	$(MAKE) -C ./source/control_plane/openapi/ all
+	echo "SKIP"
+#	$(MAKE) -C ./source/control_plane/openapi/ all
 
 utils:
 	echo "SKIP"
 #	$(MAKE) -C ./source/client/python/utils
 
 install-utils:
-	pip install htcutils
+	pip install kbhtcutils
 # pip install --force-reinstall $(PYTHON_PACKAGE_DIR)/utils-*.whl
 
 test-utils:
