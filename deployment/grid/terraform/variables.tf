@@ -1,4 +1,4 @@
-# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2024 Amazon.com, Inc. or its affiliates. 
 # SPDX-License-Identifier: Apache-2.0
 # Licensed under the Apache License, Version 2.0 https://aws.amazon.com/apache-2-0/
 
@@ -33,13 +33,13 @@ variable "lambda_runtime" {
 variable "kubernetes_version" {
   description = "Name of EKS cluster in AWS"
   type        = string
-  default     = "1.25"
+  default     = "1.31"
 }
 
 variable "k8s_ca_version" {
   description = "Cluster autoscaler version"
   type        = string
-  default     = "v1.21.0"
+  default     = "v1.31.0"
 }
 
 variable "k8s_keda_version" {
