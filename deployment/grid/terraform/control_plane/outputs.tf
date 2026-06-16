@@ -39,7 +39,7 @@ output "ecr_pull_through_cache_policy_arn" {
 }
 
 output "node_drainer_lambda_role_arn" {
-  value = module.node_drainer.lambda_role_arn
+  value = try(module.node_drainer[0].lambda_role_arn, null)
 }
 
 output "htc_data_cache_password" {

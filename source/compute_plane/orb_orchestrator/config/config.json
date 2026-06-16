@@ -1,0 +1,39 @@
+{
+  "scheduler": {
+    "type": "default"
+  },
+  "provider": {
+    "providers": [
+      {
+        "name": "aws_instance-profile_eu-west-1",
+        "type": "aws",
+        "enabled": true,
+        "config": {
+          "profile": "",
+          "region": "eu-west-1",
+          "storage": {
+            "dynamodb": {
+              "region": "eu-west-1",
+              "table_prefix": "orb-poc",
+              "profile": ""
+            }
+          }
+        },
+        "template_defaults": {
+          "subnet_ids": [
+            "subnet-3fdceb77"
+          ]
+        }
+      }
+    ],
+    "default_provider_instance": "aws_instance-profile_eu-west-1"
+  },
+  "storage": {
+    "strategy": "dynamodb",
+    "dynamodb_strategy": {
+      "region": "eu-west-1",
+      "table_prefix": "orb-poc",
+      "profile": ""
+    }
+  }
+}

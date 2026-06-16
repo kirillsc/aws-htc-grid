@@ -8,6 +8,81 @@ variable "region" {
   default     = "eu-west-1"
 }
 
+#######################################
+# Worker-plane backend selection (EKS vs EC2)
+#######################################
+
+variable "worker_backend" {
+  description = "Which worker plane to deploy: 'eks' (Helm/KEDA, default) or 'ec2' (Docker Compose pairs scaled by ORB)."
+  type        = string
+  default     = "eks"
+
+  validation {
+    condition     = contains(["eks", "ec2"], var.worker_backend)
+    error_message = "worker_backend must be either \"eks\" or \"ec2\"."
+  }
+}
+
+variable "ec2_instance_type" {
+  description = "EC2 worker instance type (ec2 backend)."
+  type        = string
+  default     = "m6i.large"
+}
+
+variable "ec2_pairs_per_instance" {
+  description = "Fixed number of Agent+RIE pairs per worker instance. 0 = auto-compute from instance capacity (ec2 backend)."
+  type        = number
+  default     = 0
+}
+
+variable "ec2_pair_cpu" {
+  description = "vCPU budget per worker pair, used by the boot-time NUM_PAIRS auto-compute (ec2 backend)."
+  type        = number
+  default     = 1
+}
+
+variable "ec2_pair_memory" {
+  description = "Memory budget (MB) per worker pair, used by the boot-time NUM_PAIRS auto-compute (ec2 backend)."
+  type        = number
+  default     = 2048
+}
+
+variable "ec2_instance_volume_size" {
+  description = "Root EBS volume size (GiB) for worker instances (ec2 backend)."
+  type        = number
+  default     = 30
+}
+
+variable "ec2_compose_plugin_version" {
+  description = "docker-compose plugin version staged to S3 for worker instances (ec2 backend)."
+  type        = string
+  default     = "v2.29.7"
+}
+
+variable "orb_min_instances" {
+  description = "Minimum worker instances the capacity controller will keep (ec2 backend)."
+  type        = number
+  default     = 0
+}
+
+variable "orb_max_instances" {
+  description = "Maximum worker instances the capacity controller may launch (ec2 backend)."
+  type        = number
+  default     = 5
+}
+
+variable "orb_target_pending_per_instance" {
+  description = "Target pending tasks per worker instance (~2 * NUM_PAIRS); the controller scales to keep backlog near this. Tune by load test (ec2 backend)."
+  type        = number
+  default     = 4
+}
+
+variable "orb_control_interval" {
+  description = "Capacity-controller reconcile interval in seconds (ec2 backend)."
+  type        = number
+  default     = 60
+}
+
 variable "input_role" {
   description = "Additional IAM roles to add to the aws-auth configmap."
   type = list(object({

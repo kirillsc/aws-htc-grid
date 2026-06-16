@@ -296,6 +296,13 @@ variable "graceful_termination_delay" {
 variable "eks_managed_node_groups" {
   description = "Map of names and ARNs of EKS Managed Node Group ASGs"
   type        = map(map(string))
+  default     = {}
+}
+
+variable "enable_node_drainer" {
+  description = "Create the EKS node_drainer Lambda + its IAM policy/KMS key. Only the eks worker backend needs it; false on the ec2 backend (where an empty node-group map would make the data policy invalid)."
+  type        = bool
+  default     = true
 }
 
 variable "lambda_configuration_s3_source" {
