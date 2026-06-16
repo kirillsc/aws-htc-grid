@@ -5,6 +5,12 @@
 # Capacity controller: EventBridge-scheduled Lambda that reconciles worker capacity to
 # the backlog by invoking the ORB orchestrator (create/terminate). Mirrors the EKS
 # KEDA+Cluster-Autoscaler control loop for the ec2 backend.
+#
+# Single-flight is enforced by reserved_concurrent_executions = 1 (ADR-001): at most one
+# tick runs at a time, so overlapping/duplicate invocations cannot double-issue ORB's
+# non-idempotent create. (No DynamoDB lock — concurrency=1 frees on exit, with no stuck
+# state. Sequential over-creation is still prevented by ORB status listing new instances
+# as pending on the next tick.)
 
 locals {
   account_id           = data.aws_caller_identity.current.account_id
@@ -12,7 +18,6 @@ locals {
   partition            = data.aws_partition.current.partition
   lambda_build_runtime = "${var.aws_htc_ecr}/ecr-public/sam/build-${var.lambda_runtime}:1"
   function_name        = "capacity_controller-${var.suffix}"
-  lock_table_name      = "capacity_controller_lock-${var.suffix}"
 
   # EventBridge rate() only supports minutes/hours/days (min 1 minute) with singular/plural
   # agreement. Convert control_interval (seconds) to a valid minute-based expression.
@@ -23,31 +28,10 @@ locals {
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 
-# Single-flight lock table.
-resource "aws_dynamodb_table" "lock" {
-  name         = local.lock_table_name
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "id"
-
-  attribute {
-    name = "id"
-    type = "S"
-  }
-
-  ttl {
-    attribute_name = "expires_at"
-    enabled        = true
-  }
-
-  tags = {
-    service = "htc-aws"
-  }
-}
-
-# Controller permissions: invoke orchestrator, read backlog metric, RW the lock table.
+# Controller permissions: invoke orchestrator, read backlog metric.
 resource "aws_iam_policy" "controller" {
   name        = "capacity-controller-${var.suffix}"
-  description = "Capacity controller: invoke ORB orchestrator, read backlog metric, lock table"
+  description = "Capacity controller: invoke ORB orchestrator, read backlog metric"
   policy      = <<EOF
 {
   "Version": "2012-10-17",
@@ -62,12 +46,6 @@ resource "aws_iam_policy" "controller" {
       "Sid": "ReadBacklogMetric",
       "Action": ["cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics", "cloudwatch:ListMetrics"],
       "Resource": "*",
-      "Effect": "Allow"
-    },
-    {
-      "Sid": "LockTable",
-      "Action": ["dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:GetItem"],
-      "Resource": "${aws_dynamodb_table.lock.arn}",
       "Effect": "Allow"
     }
   ]
@@ -90,6 +68,9 @@ module "capacity_controller" {
   memory_size = 256
   timeout     = 120
   runtime     = var.lambda_runtime
+
+  # Single-flight: at most one reconcile tick runs at a time (ADR-001).
+  reserved_concurrent_executions = 1
 
   role_name        = "role_capacity_controller_${var.suffix}"
   role_description = "Capacity controller Lambda role"
@@ -117,7 +98,6 @@ module "capacity_controller" {
     MIN_INSTANCES               = tostring(var.min_instances)
     MAX_INSTANCES               = tostring(var.max_instances)
     TARGET_PENDING_PER_INSTANCE = tostring(var.target_pending_per_instance)
-    LOCK_TABLE                  = aws_dynamodb_table.lock.name
   }
 
   tags = {
