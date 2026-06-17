@@ -214,6 +214,64 @@ class StateTableDDB:
             logging.error(msg)
             raise e
 
+    def query_live_tasks(self):
+        """
+        Generator. Mirror of query_expired_tasks(): for each state partition returns the
+        tasks that are currently being processed AND whose heartbeat has NOT yet expired
+        (heartbeat_expiration_timestamp > now), i.e. work that is actively in flight right now.
+
+        Used by the EC2 capacity controller to find which workers are busy before scaling
+        them down: a task_owner of "<instance-id>-pair-N" maps the live task back to the EC2
+        instance running it. Reuses the same gsi_ttl_index and 32-partition fan-out as the
+        TTL checker, just with the opposite heartbeat comparison.
+        """
+        count = 0
+        starting_state_id = random.randint(0, self.MAX_STATE_PARTITIONS - 1)
+        while count < self.MAX_STATE_PARTITIONS:
+            partition_to_check = self.__get_state_partition_at_index(
+                starting_state_id % self.MAX_STATE_PARTITIONS
+            )
+
+            yield self.__get_live_tasks_for_partition(partition_to_check)
+
+            count += 1
+            starting_state_id += 1
+
+    def __get_live_tasks_for_partition(self, state_partition):
+        try:
+            now = int(time.time())
+            response = self.state_table.query(
+                IndexName="gsi_ttl_index",
+                KeyConditionExpression=Key("task_status").eq(
+                    self.__make_task_state_from_state_and_partition(
+                        TASK_STATE_PROCESSING, state_partition
+                    )
+                )
+                & Key("heartbeat_expiration_timestamp").gt(now),
+                Limit=self.RETRIEVE_EXPIRED_TASKS_LIMIT,
+            )
+
+            return response["Items"]
+
+        except ClientError as e:
+            if e.response["Error"]["Code"] in [
+                "ThrottlingException",
+                "ProvisionedThroughputExceededException",
+            ]:
+                msg = f"{__name__} Failed. Throttling."
+                logging.warning(msg)
+                raise StateTableException(e, msg, caused_by_throttling=True)
+
+            else:
+                msg = f"{__name__} Failed. Exception: [{e.response['Error']}]"
+                logging.error(msg)
+                raise Exception(e)
+
+        except Exception as e:
+            msg = f"{__name__} Failed. Exception: [{e.response['Error']}]"
+            logging.error(msg)
+            raise e
+
     def retry_task(self, task_id, new_retry_count):
         """
         Puts task back into pending state, available for workers to be picked up.

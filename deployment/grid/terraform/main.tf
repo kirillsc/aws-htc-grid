@@ -381,6 +381,7 @@ module "orb_orchestrator" {
   worker_instance_type        = var.ec2_instance_type
   worker_user_data_ssm_param  = aws_ssm_parameter.worker_user_data[0].name
   orb_template_id             = "RunInstances-OnDemand"
+  drain_deadline_sec          = var.ec2_drain_deadline_sec
   kms_key_admin_arns          = [data.aws_caller_identity.current.arn]
   kms_deletion_window         = var.kms_deletion_window
 }
@@ -405,6 +406,10 @@ module "capacity_controller" {
   max_instances               = var.orb_max_instances
   target_pending_per_instance = var.orb_target_pending_per_instance
   control_interval            = var.orb_control_interval
+  state_table_name            = local.ddb_state_table
+  state_table_arn             = "arn:${data.aws_partition.current.partition}:dynamodb:${var.region}:${local.account_id}:table/${local.ddb_state_table}"
+  state_table_service         = var.state_table_service
+  state_table_config          = var.state_table_config
   kms_key_admin_arns          = [data.aws_caller_identity.current.arn]
   kms_deletion_window         = var.kms_deletion_window
 }

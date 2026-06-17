@@ -82,11 +82,17 @@ sequenceDiagram
         ORB->>EC2: RunInstances (worker template)
         Note over EC2: cloud-init: SSM config → ECR login →<br/>NUM_PAIRS = min(vCPU/pair_cpu, mem/pair_mem) →<br/>docker compose up -d (N agent+RIE pairs)
         EC2->>SQS: long-poll, claim, run, write results
-    else desired < live  (scale down)
-        Note over CTL: pick oldest live machine ids
-        CTL->>ORB: invoke {"action":"terminate","machine_ids":[...]}
+    else desired < live  (scale down — graceful, ADR-003)
+        Note over CTL: pick victims (idle-first via live-task heartbeat, then oldest)
+        CTL->>ORB: invoke {"action":"cordon","machine_ids":[...]}
+        ORB->>EC2: CreateTags(draining, drain_deadline) + SSM `compose stop`
+        Note over EC2,SQS: agent finishes in-flight task, stops claiming (SIGTERM)
+        Note over CTL: NEXT tick sweeps: query live-task heartbeat (gsi_ttl_index)
+        CTL->>DDB: Query processing* AND heartbeat > now (per partition)
+        DDB-->>CTL: task_owner -> busy instance ids
+        CTL->>ORB: invoke {"action":"terminate"} once idle (or past deadline)
         ORB->>EC2: TerminateInstances
-        Note over EC2,SQS: v1: no graceful drain —<br/>in-flight tasks re-queued by ttl_checker
+        Note over EC2,SQS: stragglers past deadline re-queued by ttl_checker
     else desired == live
         Note over CTL: no-op
     end
@@ -113,5 +119,12 @@ sequenceDiagram
   them via `status`, so the loop self-corrects rather than over-launching.
 - **Two scaling levels.** ORB scales the number of instances; each instance computes its
   own pair count (`NUM_PAIRS`) at boot. Per-instance worker count is static.
-- **Deferred (v1).** No graceful drain on scale-down (ttl_checker re-queues; needs
-  idempotent tasks); on-demand RunInstances only (EC2 Fleet/Spot is a later phase).
+- **Graceful, task-aware scale-down (ADR-003).** Scale-down is a two-phase **cordon → sweep →
+  terminate** loop. The controller cordons a victim (orchestrator `cordon`: tag `draining` +
+  SSM `docker compose stop`), the agent finishes its in-flight task and stops claiming, and a
+  later tick terminates the instance once the **live-task heartbeat** (`query_live_tasks` over
+  the same `gsi_ttl_index` the `ttl_checker` uses, `heartbeat > now`) shows it idle — or once
+  the `drain_deadline` passes (stragglers re-queued by `ttl_checker`; needs idempotent tasks).
+  No new index/table/agent change. See `docs/architecture_design_decisions.md`.
+- **Deferred (v1).** On-demand RunInstances only (EC2 Fleet/Spot is a later phase); no Step
+  Functions drain (the cordon/heartbeat loop replaces the need for it).

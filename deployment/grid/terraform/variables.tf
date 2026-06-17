@@ -83,6 +83,12 @@ variable "orb_control_interval" {
   default     = 60
 }
 
+variable "ec2_drain_deadline_sec" {
+  description = "Seconds a cordoned worker may finish in-flight work before being force-terminated on graceful scale-down (ec2 backend; ≈ worker compose stop_grace_period)."
+  type        = number
+  default     = 1500
+}
+
 variable "input_role" {
   description = "Additional IAM roles to add to the aws-auth configmap."
   type = list(object({

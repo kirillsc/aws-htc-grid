@@ -4,6 +4,69 @@ Running log of notable design decisions for the EC2 worker-plane backend. Newest
 
 ---
 
+## ADR-003: Graceful, task-aware scale-down via cordon + heartbeat-detected idleness
+
+**Status:** Decided — scale-down is a two-phase **cordon → sweep → terminate** loop driven by
+the capacity controller, using the *existing* task heartbeat as the busy signal. No new
+DynamoDB index, no new table, no agent change, no Step Functions.
+
+**Context.**
+v1 scale-down picked the oldest live machines and terminated them immediately. Any task
+in-flight on a terminated instance was killed and only recovered when `ttl_checker` re-queued
+it after its heartbeat lapsed — lossy, and dependent on every task being idempotent. We want to
+terminate only instances that have no in-flight work (or have exceeded a drain deadline),
+without blocking the 1-minute control tick.
+
+**What we reuse (nothing new on the hot path).**
+- **Busy signal = the existing heartbeat.** Each agent, on claim and every
+  `task_ttl_refresh_interval_sec`, writes `heartbeat_expiration_timestamp = now + offset` on
+  its task row while it is `processing*`. A row that is `processing*` with
+  `heartbeat_expiration_timestamp > now` is a pair working *right now*.
+- **Index = the existing `gsi_ttl_index`.** It already projects `task_owner`. `ttl_checker`
+  already queries it across all 32 state partitions with `heartbeat < now`; we add the mirror
+  (`query_live_tasks`, `heartbeat > now`) and reuse the same throttle-skip guard.
+- **Instance identity = the existing `task_owner`.** On EC2 `task_owner = "<instance-id>-pair-N"`
+  (the instance id comes from IMDS in user-data), so `task_owner.split("-pair-")[0]` is the
+  EC2 instance — the same id ORB uses as `machine_id`. No lookup, no join.
+- **Drain = the agent's existing SIGTERM behaviour.** `docker compose -p htc-workers stop`
+  (sent over SSM by the orchestrator) makes each agent's `GracefulKiller` finish its in-flight
+  task and stop claiming new ones, within the compose `stop_grace_period` (1500s).
+
+**Loop (each tick; single-flight by ADR-001).**
+1. Read backlog + ORB `status` (now enriched with each machine's `htc:lifecycle` /
+   `htc:drain_deadline` tags). `active` = live minus `draining`.
+2. Compute the busy-instance set from `query_live_tasks`. If the state table is throttling,
+   defer scale-down this tick (fail safe = keep capacity).
+3. **Sweep `draining` instances:** not-busy → `terminate`; past `drain_deadline` → `terminate`
+   anyway (stragglers re-queued by `ttl_checker`); backlog rebounded → `uncordon` (reclaim).
+4. **Reconcile `active`:** surplus → **`cordon`** the victims (idle-first, then oldest); they
+   become `draining` and a later tick's sweep terminates them once idle. Cordon ≠ terminate.
+
+Because cordon stops new claims, once an instance leaves the busy set it stays out — no
+terminate/claim race. An idle instance is cordoned on tick N and terminated on tick N+1.
+
+**Decision rationale.** This is the minimal change that makes scale-down task-aware: it adds
+no schema, no write amplification, and no new service, and it reuses a proven, throttle-aware
+access pattern (`ttl_checker`'s 32-partition `gsi_ttl_index` fan-out). ORB stays the actuator
+(ADR-002): the controller decides, the orchestrator performs the EC2 tag + SSM + terminate.
+
+**Consequences / trade-offs.**
+- Safety is **best-effort drain + `ttl_checker` backstop**: a task exceeding `drain_deadline` is
+  still killed and re-queued (tasks are already assumed idempotent in v1).
+- "Idle" means "idle within ~`heartbeat offset` (≈30s)"; fine for scale-down granularity.
+- Two-tick latency to actually terminate (cordon, then sweep) — intentional, never blocks a tick.
+- SSM cordon is best-effort; the `drain_deadline` tag guarantees eventual termination even if the
+  SSM command never lands, so no instance can pin capacity forever.
+- The controller now bundles the shared state-table DAL (`api-v0.1` + `utils`, boto3-only) and
+  gains `dynamodb:Query` on the state table + its indexes; the orchestrator gains
+  `ec2:DeleteTags` + `ssm:SendCommand`.
+
+**Revisit if:** the 32-partition fan-out per tick becomes material at very large fleet sizes
+(then a sparse instance-scoped registry/GSI keyed on idleness is the next step), or a hard
+no-re-queue guarantee is required (then block termination while any task is in flight).
+
+---
+
 ## ADR-002: Keep capacity_controller and orb_orchestrator as separate Lambdas
 
 **Status:** Decided — **two separate Lambdas** (controller invokes orchestrator via

@@ -69,6 +69,12 @@ variable "worker_user_data_ssm_param" {
   type        = string
 }
 
+variable "drain_deadline_sec" {
+  description = "Seconds a cordoned worker may finish in-flight work before being force-terminated on scale-down (≈ worker compose stop_grace_period)"
+  type        = number
+  default     = 1500
+}
+
 variable "kms_key_admin_arns" {
   description = "IAM principal ARNs allowed to administer the ORB state CMK"
   type        = list(string)

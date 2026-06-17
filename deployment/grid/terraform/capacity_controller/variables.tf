@@ -82,6 +82,28 @@ variable "control_interval" {
   default     = 60
 }
 
+variable "state_table_name" {
+  description = "DynamoDB task state table name (read for the live-task heartbeat busy-worker detection)"
+  type        = string
+}
+
+variable "state_table_arn" {
+  description = "DynamoDB task state table ARN (for the dynamodb:Query grant on the table + its GSIs)"
+  type        = string
+}
+
+variable "state_table_service" {
+  description = "State table backend service (DynamoDB)"
+  type        = string
+  default     = "DynamoDB"
+}
+
+variable "state_table_config" {
+  description = "State table client config JSON (e.g. retries)"
+  type        = string
+  default     = "{}"
+}
+
 variable "kms_key_admin_arns" {
   description = "IAM principal ARNs allowed to administer the controller CloudWatch logs CMK"
   type        = list(string)

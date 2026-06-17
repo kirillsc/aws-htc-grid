@@ -47,6 +47,15 @@ resource "aws_iam_policy" "controller" {
       "Action": ["cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics", "cloudwatch:ListMetrics"],
       "Resource": "*",
       "Effect": "Allow"
+    },
+    {
+      "Sid": "QueryLiveTasks",
+      "Action": ["dynamodb:Query"],
+      "Resource": [
+        "${var.state_table_arn}",
+        "${var.state_table_arn}/index/*"
+      ],
+      "Effect": "Allow"
     }
   ]
 }
@@ -57,7 +66,27 @@ module "capacity_controller" {
   source  = "terraform-aws-modules/lambda/aws"
   version = "~> 5.0"
 
-  source_path     = "../../../source/compute_plane/python/lambda/capacity_controller"
+  # Bundle the shared state-table DAL (api-v0.1) + utils so the controller can read the
+  # live-task heartbeat to detect which workers are busy (same libs the ttl_checker uses).
+  source_path = [
+    "../../../source/compute_plane/python/lambda/capacity_controller",
+    {
+      path = "../../../source/client/python/api-v0.1/"
+      patterns = [
+        "!README\\.md",
+        "!setup\\.py",
+        "!LICENSE*",
+      ]
+    },
+    {
+      path = "../../../source/client/python/utils/"
+      patterns = [
+        "!README\\.md",
+        "!setup\\.py",
+        "!LICENSE*",
+      ]
+    },
+  ]
   function_name   = local.function_name
   build_in_docker = true
   docker_image    = local.lambda_build_runtime
@@ -98,6 +127,9 @@ module "capacity_controller" {
     MIN_INSTANCES               = tostring(var.min_instances)
     MAX_INSTANCES               = tostring(var.max_instances)
     TARGET_PENDING_PER_INSTANCE = tostring(var.target_pending_per_instance)
+    STATE_TABLE_NAME            = var.state_table_name
+    STATE_TABLE_SERVICE         = var.state_table_service
+    STATE_TABLE_CONFIG          = var.state_table_config
   }
 
   tags = {
