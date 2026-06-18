@@ -37,9 +37,12 @@ import os
 import time
 
 import boto3
+from aws_lambda_powertools import Logger
 
 from api.state_table_manager import state_table_manager
 from utils.state_table_common import StateTableException
+
+logger = Logger(service=os.environ.get("POWERTOOLS_SERVICE_NAME", "capacity_controller"))
 
 REGION = os.environ["REGION"]
 ORCHESTRATOR_FUNCTION = os.environ["ORCHESTRATOR_FUNCTION_NAME"]
@@ -127,7 +130,7 @@ def _busy_instance_ids():
                     busy.add(instance_id)
     except StateTableException as exc:
         if getattr(exc, "caused_by_throttling", False):
-            print("state table throttling: deferring scale-down this tick")
+            logger.warning("state table throttling: deferring scale-down this tick")
             return None
         raise
     return busy
@@ -138,6 +141,7 @@ def _machine_age_key(m: dict):
     return m.get("created_at") or m.get("launch_time") or m.get("machine_id", "")
 
 
+@logger.inject_lambda_context(log_event=False)
 def handler(event, context):  # noqa: ANN001
     # Single-flight is guaranteed by reserved_concurrent_executions = 1 (ADR-001); no
     # application-level lock is needed.
@@ -152,10 +156,16 @@ def handler(event, context):  # noqa: ANN001
     desired = math.ceil(backlog / TARGET_PER_INSTANCE) if backlog > 0 else 0
     desired = max(MIN_INSTANCES, min(MAX_INSTANCES, desired))
 
-    print(
-        f"backlog={backlog} live={live} active={len(active)} draining={len(draining)} "
-        f"target/inst={TARGET_PER_INSTANCE} desired={desired} "
-        f"(min={MIN_INSTANCES} max={MAX_INSTANCES})"
+    logger.info(
+        "capacity reconcile",
+        backlog=backlog,
+        live=live,
+        active=len(active),
+        draining=len(draining),
+        target_per_instance=TARGET_PER_INSTANCE,
+        desired=desired,
+        min_instances=MIN_INSTANCES,
+        max_instances=MAX_INSTANCES,
     )
 
     busy = _busy_instance_ids()  # None if state table is throttling
@@ -186,9 +196,11 @@ def handler(event, context):  # noqa: ANN001
 
     if to_uncordon:
         res = _invoke_orchestrator({"action": "uncordon", "machine_ids": to_uncordon})
+        logger.info("uncordon", machine_ids=to_uncordon, count=len(to_uncordon))
         actions.append({"action": "uncordon", "machine_ids": to_uncordon, "orchestrator": res})
     if to_terminate:
         res = _invoke_orchestrator({"action": "terminate", "machine_ids": to_terminate})
+        logger.info("terminate", machine_ids=to_terminate, count=len(to_terminate))
         actions.append({"action": "terminate", "machine_ids": to_terminate, "orchestrator": res})
 
     # --- 2. Scale up: any remaining deficit after uncordoning -> create new instances ------
@@ -196,6 +208,7 @@ def handler(event, context):  # noqa: ANN001
         res = _invoke_orchestrator(
             {"action": "create", "template_id": TEMPLATE_ID, "count": deficit}
         )
+        logger.info("scale_up", count=deficit, template_id=TEMPLATE_ID)
         actions.append({"action": "create", "count": deficit, "orchestrator": res})
 
     # --- 3. Scale down: surplus active instances -> cordon (graceful drain) -----------------
@@ -204,7 +217,9 @@ def handler(event, context):  # noqa: ANN001
         if busy is None:
             # State table throttling: cannot tell which instances are idle. Defer cordoning
             # to keep capacity rather than risk draining a busy worker.
-            print(f"surplus={surplus} but busy-set unknown (throttling); skipping cordon")
+            logger.warning(
+                "surplus but busy-set unknown (throttling); skipping cordon", surplus=surplus
+            )
         else:
             # Victim order: idle instances first, then oldest, so we drain the cheapest first.
             def _victim_key(m: dict):
@@ -218,8 +233,11 @@ def handler(event, context):  # noqa: ANN001
             ]
             if victims:
                 res = _invoke_orchestrator({"action": "cordon", "machine_ids": victims})
+                logger.info("cordon", machine_ids=victims, count=len(victims))
                 actions.append({"action": "cordon", "machine_ids": victims, "orchestrator": res})
 
     if not actions:
+        logger.info("noop", live=live, desired=desired)
         return {"statusCode": 200, "action": "noop", "live": live, "desired": desired}
+    logger.info("reconcile actions", action_count=len(actions))
     return {"statusCode": 200, "actions": actions, "live": live, "desired": desired}

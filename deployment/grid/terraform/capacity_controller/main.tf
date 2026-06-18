@@ -75,7 +75,15 @@ module "capacity_controller" {
   # Bundle the shared state-table DAL (api-v0.1) + utils so the controller can read the
   # live-task heartbeat to detect which workers are busy (same libs the ttl_checker uses).
   source_path = [
-    "../../../source/compute_plane/python/lambda/capacity_controller",
+    {
+      path             = "../../../source/compute_plane/python/lambda/capacity_controller"
+      pip_requirements = "../../../source/compute_plane/python/lambda/capacity_controller/requirements.txt"
+      patterns = [
+        "!tests/.*",
+        "!.*__pycache__.*",
+        "!.*\\.pyc",
+      ]
+    },
     {
       path = "../../../source/client/python/api-v0.1/"
       patterns = [
@@ -123,6 +131,10 @@ module "capacity_controller" {
   tracing_mode          = "Active"
 
   environment_variables = {
+    # Powertools structured logging: service name groups this Lambda's records; level is
+    # env-driven (no code change to switch to DEBUG).
+    POWERTOOLS_SERVICE_NAME     = "capacity_controller"
+    LOG_LEVEL                   = "INFO"
     REGION                      = var.region
     ORCHESTRATOR_FUNCTION_NAME  = var.orchestrator_function_name
     ORB_TEMPLATE_ID             = var.orb_template_id

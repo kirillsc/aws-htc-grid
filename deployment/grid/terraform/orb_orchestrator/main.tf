@@ -214,6 +214,9 @@ module "orb_orchestrator" {
   # ORB dirs go under /tmp (only writable path in Lambda). ORB_ALLOW_TERMINATE_ALL is left
   # UNSET so the fleet-wide kill switch is disabled.
   environment_variables = {
+    # Powertools structured logging: service name groups records; level is env-driven.
+    POWERTOOLS_SERVICE_NAME  = "orb_orchestrator"
+    LOG_LEVEL                = "INFO"
     ORB_CONFIG_DIR           = "/var/task/orb-config"
     ORB_PROVIDER             = "aws"
     ORB_ROOT_DIR             = "/tmp/orb"

@@ -37,6 +37,9 @@ import time
 from typing import Any
 
 import boto3
+from aws_lambda_powertools import Logger
+
+logger = Logger(service=os.environ.get("POWERTOOLS_SERVICE_NAME", "orb_orchestrator"))
 
 
 def _patch_orb_at_cold_start() -> None:
@@ -54,7 +57,7 @@ def _patch_orb_at_cold_start() -> None:
 
     spec = importlib.util.find_spec("orb")
     if spec is None or not spec.submodule_search_locations:
-        print("warning: orb package not found; cannot apply runtime patches")
+        logger.warning("orb package not found; cannot apply runtime patches")
         return
     installed_orb = spec.submodule_search_locations[0]  # .../orb
     dst_root = "/tmp/orb-patched"
@@ -122,8 +125,8 @@ def _instance_drain_tags(machine_ids: list[str]) -> dict[str, dict[str, str]]:
         return {}
     try:
         resp = _ec2_client().describe_instances(InstanceIds=ids)
-    except Exception as exc:  # noqa: BLE001
-        print(f"warning: describe_instances for drain tags failed: {exc}")
+    except Exception:  # noqa: BLE001
+        logger.exception("describe_instances for drain tags failed", machine_ids=ids)
         return {}
     out: dict[str, dict[str, str]] = {}
     for reservation in resp.get("Reservations", []):
@@ -155,7 +158,7 @@ def _send_compose_command(machine_ids: list[str], command: str) -> dict[str, Any
         )
         return {"command_id": resp.get("Command", {}).get("CommandId")}
     except Exception as exc:  # noqa: BLE001
-        print(f"warning: SSM send_command {command!r} on {ids} failed: {exc}")
+        logger.exception("SSM send_command failed", command=command, machine_ids=ids)
         return {"error": str(exc)}
 
 # ORB wants writable work/log/cache/scripts/health dirs. In Lambda only /tmp is
@@ -221,8 +224,8 @@ def _materialize_grid_config() -> None:
                 boto3.client("ssm", region_name=region)
                 .get_parameter(Name=ud_param)["Parameter"]["Value"]
             )
-        except Exception as exc:  # noqa: BLE001
-            print(f"warning: could not load worker user_data from SSM {ud_param}: {exc}")
+        except Exception:  # noqa: BLE001
+            logger.exception("could not load worker user_data from SSM", ssm_param=ud_param)
 
     # config.json: table prefix (both places) + provider template_defaults subnet.
     cfg_path = os.path.join(dst, "config.json")
@@ -373,12 +376,19 @@ async def _dispatch(event: dict[str, Any]) -> dict[str, Any]:
         return {"action": "terminate", "requested_ids": machine_ids, "result": result}
 
 
+@logger.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Lambda entrypoint. Wraps the async ORB calls in a fresh event loop."""
+    action = (event or {}).get("action")
+    logger.append_keys(action=action)
     try:
         body = asyncio.run(_dispatch(event))
+        logger.info("orb dispatch ok")
         return {"statusCode": 200, "body": body}
     except BadRequest as exc:
+        # Client error (malformed payload / gated kill-switch): warn, do not stacktrace.
+        logger.warning("bad request", error=str(exc))
         return {"statusCode": 400, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001 - surface any ORB/AWS error to caller
+        logger.exception("orb dispatch failed")
         return {"statusCode": 500, "error": f"{type(exc).__name__}: {exc}"}
