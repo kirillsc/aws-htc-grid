@@ -2,6 +2,10 @@
   "scheduler": {
     "type": "default"
   },
+  "logging": {
+    "console_enabled": true,
+    "file_path": null
+  },
   "provider": {
     "providers": [
       {
