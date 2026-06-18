@@ -17,6 +17,11 @@ output "htc_data_bucket_key_arn" {
   value       = module.htc_data_bucket_kms_key.key_arn
 }
 
+output "htc_dynamodb_table_key_arn" {
+  description = "HTC DynamoDB state-table KMS Key ARN (needed by readers of the encrypted table)"
+  value       = module.htc_dynamodb_table_kms_key.key_arn
+}
+
 output "public_api_gateway_url" {
   value = aws_api_gateway_stage.htc_public_api_stage.invoke_url
 }

@@ -92,6 +92,11 @@ variable "state_table_arn" {
   type        = string
 }
 
+variable "state_table_kms_key_arn" {
+  description = "KMS CMK ARN encrypting the state table (kms:Decrypt is required to Query the encrypted table)"
+  type        = string
+}
+
 variable "state_table_service" {
   description = "State table backend service (DynamoDB)"
   type        = string

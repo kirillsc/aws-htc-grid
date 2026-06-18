@@ -56,6 +56,12 @@ resource "aws_iam_policy" "controller" {
         "${var.state_table_arn}/index/*"
       ],
       "Effect": "Allow"
+    },
+    {
+      "Sid": "DecryptStateTable",
+      "Action": ["kms:Decrypt", "kms:DescribeKey"],
+      "Resource": "${var.state_table_kms_key_arn}",
+      "Effect": "Allow"
     }
   ]
 }

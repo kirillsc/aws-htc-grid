@@ -408,6 +408,7 @@ module "capacity_controller" {
   control_interval            = var.orb_control_interval
   state_table_name            = local.ddb_state_table
   state_table_arn             = "arn:${data.aws_partition.current.partition}:dynamodb:${var.region}:${local.account_id}:table/${local.ddb_state_table}"
+  state_table_kms_key_arn     = module.control_plane.htc_dynamodb_table_key_arn
   state_table_service         = var.state_table_service
   state_table_config          = var.state_table_config
   kms_key_admin_arns          = [data.aws_caller_identity.current.arn]
