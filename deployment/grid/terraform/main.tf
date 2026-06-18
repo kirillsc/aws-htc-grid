@@ -147,6 +147,7 @@ module "compute_plane" {
   cognito_userpool_id               = module.control_plane.cognito_userpool_id
   kms_key_admin_roles               = var.kms_key_admin_roles
   kms_deletion_window               = var.kms_deletion_window
+  grafana_allowed_cidrs             = var.grafana_allowed_cidrs
   # allowed_access_cidr_blocks        = local.allowed_access_cidr_blocks
 }
 

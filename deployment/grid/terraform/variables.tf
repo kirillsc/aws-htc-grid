@@ -513,6 +513,12 @@ variable "allowed_access_cidr_blocks" {
   default     = []
 }
 
+variable "grafana_allowed_cidrs" {
+  description = "CIDR blocks allowed to reach the internet-facing Grafana ALB (frontend SG inbound). Default is a deny placeholder; override per deploy."
+  type        = list(string)
+  default     = ["127.0.0.1/32"]
+}
+
 variable "eks_node_volume_size" {
   description = "Size in GB for EKS Worker Nodes"
   type        = number
