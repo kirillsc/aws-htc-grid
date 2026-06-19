@@ -4,6 +4,169 @@ Running log of notable design decisions for the EC2 worker-plane backend. Newest
 
 ---
 
+## ADR-005: Controller-owned drain core; ORB terminates (ORB owns the API choice)
+
+**Status:** Decided — the controller owns a **provider-independent drain core** (cordon,
+idle-detect, sweep) and asks ORB to terminate the idle instances it selects. ORB stays the single
+capacity abstraction: it picks the AWS API (RunInstances / EC2Fleet / ASG, possibly different per
+request) and decrements the right request on terminate. A polymorphic provider seam was considered
+and **dropped** — ORB already abstracts the capacity API, so a second seam earns nothing today.
+
+**Context.**
+ADR-003's graceful drain was entangled with ORB: the controller invoked ORB actions
+`cordon`/`uncordon`/`terminate`, and ORB owned the SSM `docker compose stop` + the EC2 drain tags.
+But draining is **provider-independent** — cordon (SSM stop), idle-detection (the heartbeat query),
+and drain-state (EC2 tags) are EC2-level functions identical no matter how an instance was
+provisioned. ADR-004 showed ORB's ASGCapacityManager can never host an ASG lifecycle hook, so the
+*controller* (not the capacity API) must own drain for it to work across RunInstances / EC2Fleet /
+ASG.
+
+**Decision.**
+- **DRAIN is EC2-level and controller-owned** (`drain.py`) — cordon = SSM `compose stop` +
+  `htc:lifecycle`/`htc:drain_deadline` tags; idle-detect = the task heartbeat; sweep =
+  terminate-when-idle/expired or uncordon. Universal across every provisioning API.
+- **The KILL goes through ORB** (`orb_client.terminate(ids)`), never a bare `ec2:TerminateInstances`
+  from the controller. A self-healing API (ASG, Fleet-maintain) would relaunch a replacement if the
+  instance were killed without decrementing desired, and ORB's bookkeeping would drift. ORB owns the
+  API choice; the controller just hands it the idle ids. Preserves ADR-002 (controller = brain, ORB
+  = hands).
+- **ORB client, not a provider seam:** `orb_client.list_live()` / `create(n)` / `terminate(ids)`
+  wraps the orchestrator's `status` / `create` / `terminate`. The polymorphic `CapacityProvider`
+  seam (OrbProvider/AsgProvider) was dropped — ORB is already the capacity abstraction.
+- **What moves:** the controller GAINS `ssm:SendCommand` + `ec2:CreateTags`/`DeleteTags`/
+  `DescribeInstances` (boto3-only). The orchestrator LOSES `cordon`/`uncordon` and the `status`
+  drain-tag enrichment; `DRAIN_DEADLINE_SEC` + the SSM/tag IAM move to the controller module.
+
+**Crash recovery / idempotency.**
+The controller is a **stateless reconciler**: it holds no durable state between ticks and
+re-derives the world each tick from observed truth (`orb_client.list_live()`, the EC2 drain tags,
+the heartbeat busy-set). `reserved_concurrent_executions = 1` (ADR-001) means ticks never overlap.
+So a crash at a random point is generally self-healing — the next tick re-observes and re-converges:
+- Crash mid-sweep after terminating some ids → killed ones drop out of `list_live`; the rest are
+  re-evaluated next tick. Terminating an already-terminating instance is a no-op.
+- Crash after reads, before any mutation → nothing happened; redone next tick.
+
+Three real gaps and their mitigations:
+- **Cordon is two non-atomic steps (CreateTags then SSM stop).** A crash between them leaves an
+  instance tagged `draining` but never told to stop; the next tick routes it to the *sweep*, not
+  back to cordon, so the stop would never be retried (it would work until its deadline, then get
+  force-killed — avoidable task loss). **Mitigation (baked into the drain core): the sweep
+  re-issues `compose stop` for any `draining` instance still in the busy set** (idempotent — a
+  no-op if already stopping). Tag-before-stop ordering is kept (tagged-but-not-stopped is
+  recoverable; stopped-but-not-tagged would look like idle live capacity).
+- **ORB `create` is non-idempotent + async.** A crash after `create` launched instances but before
+  they appear in `list_live` can make a fresh tick create again → transient over-provisioning until
+  a later tick scales the surplus down. Mitigation: ensure ORB records the machine synchronously so
+  `list_live` sees it on the next tick; client-token dedup is a follow-up.
+- **ORB launch-template leak** (one per RunInstances request, not deleted) is amplified by
+  crash-induced double-creates. Mitigation: a periodic launch-template sweeper (tracked ORB-quirks
+  item).
+
+No untracked-instance orphans originate in the controller itself (it tracks nothing; ORB's
+`list_live` is the source of truth). The two real cost vectors are double-create over-provisioning
+(self-correcting) and leaked launch templates (needs the sweeper).
+
+**Revisit if:** the create double-launch window proves material (then add client-token dedup in
+the ORB client / orchestrator), or a second capacity backend ever exists that ORB cannot abstract
+(only then would a provider seam earn its place).
+
+**Related:** [[ADR-004]] (why ASG hook drain is unavailable under ORB), [[ADR-003]] (the cordon/sweep
+mechanism this refactors), [[ADR-002]] (brain/hands split, preserved), [[ADR-001]] (single-flight).
+
+---
+
+## ADR-004: ASG lifecycle-hook drain vs ORB — why we cannot use ASG draining today
+
+**Status:** Decided — graceful scale-down stays **cordon + sweep under ORB** (ADR-003). ASG
+lifecycle-hook draining is the cleaner primitive but is **incompatible with how ORB manages
+capacity today**. Recorded so we stop re-deriving it; revisit only if ORB is removed from the
+EC2 termination path.
+
+**Context.**
+A recurring question: can we let an EC2 Auto Scaling Group (ASG) drain workers gracefully on
+scale-in, instead of the controller-driven cordon→sweep in ADR-003, and still have the
+**controller decide which instances to terminate**? The answer is: the ASG mechanism is real and
+attractive, but ORB's `ASGCapacityManager` bypasses it and would destroy a long-lived ASG. So it
+is not available while ORB owns termination.
+
+### (A) How ASG *could* handle draining (the target we cannot use yet)
+
+A single, long-lived ASG with a **termination lifecycle hook** gives native, task-aware drain:
+
+1. The ASG has a hook on `autoscaling:EC2_INSTANCE_TERMINATING`. Any termination of a **member**
+   instance is **paused** in `Terminating:Wait` instead of killing immediately.
+2. The controller (the brain) decides *which* instances to remove and calls
+   **`TerminateInstanceInAutoScalingGroup(InstanceId, ShouldDecrementDesiredCapacity=true)`** for
+   each chosen id. This overrides the ASG's own termination policy (we name the victims) **and**
+   still routes through the lifecycle hook.
+3. The hook fires → a drain handler (a Lambda, or an on-instance hook — mirrors the existing EKS
+   `node_drainer`) runs `docker compose -p htc-workers stop`; the agent's SIGTERM handler finishes
+   the in-flight task and stops claiming.
+4. For long tasks the handler sends `RecordLifecycleActionHeartbeat` to extend the pause; when the
+   worker is idle it calls `CompleteLifecycleAction(CONTINUE)` and only **then** does the ASG
+   terminate the instance.
+5. Backstop: if drain never completes, the hook timeout expires and the ASG terminates anyway;
+   the unfinished task is re-queued by `ttl_checker`.
+
+What this removes vs ADR-003: the `htc:lifecycle`/`htc:drain_deadline` tags, the `query_live_tasks`
+busy-set query (and the controller's `dynamodb:Query`/`kms:Decrypt` grants + bundled DAL), and the
+two-tick sweep. The ASG holds the instance; the controller just names victims; the hook drains.
+The ASG must be **Terraform-owned and long-lived** (created once, deleted only by `terraform
+destroy`; `min_size=0` so scale-to-zero is legal), and the actuator must be IAM-fenced to
+**capacity-only** operations (`SetDesiredCapacity`, `TerminateInstanceInAutoScalingGroup`) — never
+`Create/Update/DeleteAutoScalingGroup`.
+
+### (B) Why this is currently NOT possible with ORB
+
+ORB's `ASGCapacityManager.release_instances` does **not** terminate through the ASG. Its termination
+path is:
+
+1. `DetachInstances(ShouldDecrementDesiredCapacity=True)` (chunked 20) — **removes the instance
+   from the ASG** and drops desired capacity.
+2. `DescribeAutoScalingGroups` — read live `DesiredCapacity` after detach.
+3. `UpdateAutoScalingGroup MinSize=new_capacity` — only if `MinSize > new_capacity`.
+4. `ec2:TerminateInstances` — hard-kills the now-standalone instances.
+5. If `new_capacity == 0` after detach (last instances removed): **`DeleteAutoScalingGroup
+   (ForceDelete=True)`** + launch-template cleanup. The **same delete also runs in the fallback
+   branch** when ASG details cannot be fetched.
+
+Two independent, fatal incompatibilities with (A):
+
+- **Detach + `ec2:TerminateInstances` bypasses the lifecycle hook.** The hook only fires when the
+  **ASG** terminates a **member**. ORB detaches the instance first (so it is no longer a member),
+  then kills it with a plain EC2 terminate. There is nothing for the hook to fire on — the drain
+  is never triggered. ORB never calls `TerminateInstanceInAutoScalingGroup` (the one API that would
+  honor the hook). So the entire (A) drain is dead on arrival under ORB.
+- **ORB deletes the ASG at capacity 0 (and on read failure).** When the fleet scales to zero, ORB
+  calls `DeleteAutoScalingGroup(ForceDelete=True)` — destroying a Terraform-owned, long-lived ASG
+  out from under Terraform (state drift, lost hook + launch template, cannot scale back up).
+  `ForceDelete=True` *also* bypasses lifecycle hooks. Worse, the same delete runs in the fallback
+  branch when `DescribeAutoScalingGroups` fails, so a transient API error can destroy the ASG.
+
+ORB treats an ASG as a **disposable, request-scoped wrapper** around `ec2:TerminateInstances`
+(detach → kill → delete-when-empty). That is the opposite of the **persistent, hook-bearing ASG**
+that (A) requires. The two models are mutually exclusive; you cannot get hook-drain while ORB owns
+termination.
+
+**Decision.**
+Keep **cordon + sweep (ADR-003)** as the graceful-drain mechanism for the ORB-managed fleet. It is
+in fact the *correct* pattern given ORB's detach/terminate semantics — there is no lifecycle hook to
+lean on, so the controller must drain (cordon) before asking ORB to terminate. ASG hook-drain is
+recorded as the preferred design **for if/when ORB leaves the EC2 termination path**.
+
+**Revisit if:** we decide to drop ORB from the EC2 datapath. Then: a Terraform-owned long-lived ASG
++ a lifecycle-hook drainer (port the EKS `node_drainer`) + the controller calling
+`TerminateInstanceInAutoScalingGroup` directly, IAM-fenced to capacity-only operations. At that
+point ADR-003's cordon/tags/busy-query machinery is deleted. Note that, once the ASG provides both
+scale-up (`SetDesiredCapacity`) and graceful scale-in (hook), ORB has little left to do on the EC2
+backend — so this revisit is really the "remove ORB" decision.
+
+**Related:** [[ADR-003]] (the cordon+sweep we keep), [[ADR-002]] (controller = brain, orchestrator =
+actuator; that split is preserved in both models — only the actuator's downstream API changes),
+[[ADR-001]] (single-flight controller).
+
+---
+
 ## ADR-003: Graceful, task-aware scale-down via cordon + heartbeat-detected idleness
 
 **Status:** Decided — scale-down is a two-phase **cordon → sweep → terminate** loop driven by
