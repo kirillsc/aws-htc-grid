@@ -62,6 +62,21 @@ resource "aws_iam_policy" "controller" {
       "Action": ["kms:Decrypt", "kms:DescribeKey"],
       "Resource": "${var.state_table_kms_key_arn}",
       "Effect": "Allow"
+    },
+    {
+      "Sid": "DrainStateTags",
+      "Action": ["ec2:CreateTags", "ec2:DeleteTags", "ec2:DescribeInstances"],
+      "Resource": "*",
+      "Effect": "Allow"
+    },
+    {
+      "Sid": "DrainSsmCommand",
+      "Action": ["ssm:SendCommand"],
+      "Resource": [
+        "arn:${local.partition}:ssm:${var.region}::document/AWS-RunShellScript",
+        "arn:${local.partition}:ec2:${var.region}:${local.account_id}:instance/*"
+      ],
+      "Effect": "Allow"
     }
   ]
 }
@@ -136,6 +151,7 @@ module "capacity_controller" {
     POWERTOOLS_SERVICE_NAME     = "capacity_controller"
     LOG_LEVEL                   = "INFO"
     REGION                      = var.region
+    DRAIN_DEADLINE_SEC          = tostring(var.drain_deadline_sec)
     ORCHESTRATOR_FUNCTION_NAME  = var.orchestrator_function_name
     ORB_TEMPLATE_ID             = var.orb_template_id
     METRIC_NAMESPACE            = var.metric_namespace

@@ -82,6 +82,12 @@ variable "control_interval" {
   default     = 60
 }
 
+variable "drain_deadline_sec" {
+  description = "Seconds a cordoned worker may finish in-flight work before being force-terminated on graceful scale-down (≈ worker compose stop_grace_period)"
+  type        = number
+  default     = 1500
+}
+
 variable "state_table_name" {
   description = "DynamoDB task state table name (read for the live-task heartbeat busy-worker detection)"
   type        = string

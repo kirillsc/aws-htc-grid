@@ -116,21 +116,6 @@ resource "aws_iam_policy" "orb_orchestrator" {
       "Effect": "Allow"
     },
     {
-      "Sid": "OrbDrainTags",
-      "Action": ["ec2:DeleteTags"],
-      "Resource": "*",
-      "Effect": "Allow"
-    },
-    {
-      "Sid": "OrbDrainSsmCommand",
-      "Action": ["ssm:SendCommand"],
-      "Resource": [
-        "arn:${local.partition}:ssm:${var.region}::document/AWS-RunShellScript",
-        "arn:${local.partition}:ec2:${var.region}:${local.account_id}:instance/*"
-      ],
-      "Effect": "Allow"
-    },
-    {
       "Sid": "WorkerUserDataSsm",
       "Action": ["ssm:GetParameter"],
       "Resource": "arn:${local.partition}:ssm:${var.region}:${local.account_id}:parameter${var.worker_user_data_ssm_param}",
@@ -234,7 +219,6 @@ module "orb_orchestrator" {
     ORB_IMAGE_ID             = var.worker_ami_id
     ORB_INSTANCE_TYPE        = var.worker_instance_type
     ORB_USER_DATA_SSM_PARAM  = var.worker_user_data_ssm_param
-    ORB_DRAIN_DEADLINE_SEC   = tostring(var.drain_deadline_sec)
   }
 
   tags = {

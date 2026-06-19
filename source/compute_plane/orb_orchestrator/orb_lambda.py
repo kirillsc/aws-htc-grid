@@ -33,7 +33,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from typing import Any
 
 import boto3
@@ -79,87 +78,10 @@ _patch_orb_at_cold_start()
 # counted as capacity or re-terminated.
 LIVE_STATES = {"pending", "running", "stopping", "shutting-down"}
 
-# Graceful-drain tags written on a worker instance when it is cordoned (scale-down candidate).
-# The capacity controller reads them back via the enriched `status` action so it never needs
-# EC2 permissions of its own. drain_deadline bounds the drain: past it the controller
-# terminates the instance regardless of remaining work (stragglers re-queued by ttl_checker).
-TAG_LIFECYCLE = "htc:lifecycle"
-TAG_DRAIN_DEADLINE = "htc:drain_deadline"
-LIFECYCLE_DRAINING = "draining"
-
-# Seconds a cordoned instance is allowed to finish in-flight work before it is force-terminated.
-# Defaults to the worker compose stop_grace_period (1500s) so a clean drain normally completes.
-DRAIN_DEADLINE_SEC = int(os.environ.get("ORB_DRAIN_DEADLINE_SEC", "1500"))
-
-# Stop / start the worker compose project. `stop` sends SIGTERM to the agent containers, whose
-# GracefulKiller finishes the in-flight task and stops claiming new ones (cordon + drain);
-# `start` resumes them (uncordon). Project name matches the worker user-data.
-_COMPOSE_STOP_CMD = "docker compose -p htc-workers stop"
-_COMPOSE_START_CMD = "docker compose -p htc-workers start"
-
-_REGION = os.environ.get("ORB_REGION") or os.environ.get("AWS_REGION", "eu-west-1")
-
-
-def _ec2_client():
-    return boto3.client("ec2", region_name=_REGION)
-
-
-def _ssm_client():
-    return boto3.client("ssm", region_name=_REGION)
-
 
 def _live_machines(machines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter ORB's machine list down to live (non-terminated) machines."""
     return [m for m in machines if m.get("status") in LIVE_STATES]
-
-
-def _instance_drain_tags(machine_ids: list[str]) -> dict[str, dict[str, str]]:
-    """Return {instance_id: {lifecycle, drain_deadline}} for the given instances.
-
-    Reads the htc:* tags directly from EC2 so the controller can see drain state without
-    its own EC2 permissions. Best-effort: on any error returns an empty mapping (the
-    controller then treats instances as not-draining, which is safe).
-    """
-    ids = [m for m in machine_ids if m]
-    if not ids:
-        return {}
-    try:
-        resp = _ec2_client().describe_instances(InstanceIds=ids)
-    except Exception:  # noqa: BLE001
-        logger.exception("describe_instances for drain tags failed", machine_ids=ids)
-        return {}
-    out: dict[str, dict[str, str]] = {}
-    for reservation in resp.get("Reservations", []):
-        for inst in reservation.get("Instances", []):
-            iid = inst.get("InstanceId")
-            tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
-            if iid:
-                out[iid] = {
-                    "lifecycle": tags.get(TAG_LIFECYCLE),
-                    "drain_deadline": tags.get(TAG_DRAIN_DEADLINE),
-                }
-    return out
-
-
-def _send_compose_command(machine_ids: list[str], command: str) -> dict[str, Any]:
-    """Run a shell command on the given instances over SSM (async, best-effort).
-
-    SSM failures are logged, not raised: cordon must not fail the tick, and the
-    drain_deadline tag still forces termination even if the stop command never lands.
-    """
-    ids = [m for m in machine_ids if m]
-    if not ids:
-        return {}
-    try:
-        resp = _ssm_client().send_command(
-            InstanceIds=ids,
-            DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [command]},
-        )
-        return {"command_id": resp.get("Command", {}).get("CommandId")}
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("SSM send_command failed", command=command, machine_ids=ids)
-        return {"error": str(exc)}
 
 # ORB wants writable work/log/cache/scripts/health dirs. In Lambda only /tmp is
 # writable, so the env points there (see CDK / Dockerfile); ensure they exist
@@ -279,44 +201,10 @@ async def _dispatch(event: dict[str, Any]) -> dict[str, Any]:
     from orb import orb  # imported lazily so cold-start dir setup runs first
 
     action = (event or {}).get("action")
-    if action not in {"create", "status", "terminate", "cordon", "uncordon"}:
+    if action not in {"create", "status", "terminate"}:
         raise BadRequest(
-            "action must be one of create|status|terminate|cordon|uncordon, "
-            f"got {action!r}"
+            f"action must be one of create|status|terminate, got {action!r}"
         )
-
-    # cordon / uncordon are pure EC2 tag + SSM operations; they do not touch ORB state, so
-    # handle them without spinning up the ORB SDK client.
-    if action == "cordon":
-        machine_ids = event.get("machine_ids") or []
-        if not machine_ids:
-            raise BadRequest("cordon requires machine_ids[]")
-        deadline = int(time.time()) + DRAIN_DEADLINE_SEC
-        _ec2_client().create_tags(
-            Resources=machine_ids,
-            Tags=[
-                {"Key": TAG_LIFECYCLE, "Value": LIFECYCLE_DRAINING},
-                {"Key": TAG_DRAIN_DEADLINE, "Value": str(deadline)},
-            ],
-        )
-        ssm = _send_compose_command(machine_ids, _COMPOSE_STOP_CMD)
-        return {
-            "action": "cordon",
-            "machine_ids": machine_ids,
-            "drain_deadline": deadline,
-            "ssm": ssm,
-        }
-
-    if action == "uncordon":
-        machine_ids = event.get("machine_ids") or []
-        if not machine_ids:
-            raise BadRequest("uncordon requires machine_ids[]")
-        ssm = _send_compose_command(machine_ids, _COMPOSE_START_CMD)
-        _ec2_client().delete_tags(
-            Resources=machine_ids,
-            Tags=[{"Key": TAG_LIFECYCLE}, {"Key": TAG_DRAIN_DEADLINE}],
-        )
-        return {"action": "uncordon", "machine_ids": machine_ids, "ssm": ssm}
 
     async with orb(provider="aws") as client:
         if action == "create":
@@ -339,15 +227,6 @@ async def _dispatch(event: dict[str, Any]) -> dict[str, Any]:
             machines = result.get("machines", [])
             if not event.get("include_terminated"):
                 machines = _live_machines(machines)
-            # Enrich live machines with their drain tags so the controller can see which
-            # instances are draining (and until when) without needing EC2 permissions.
-            drain_tags = _instance_drain_tags(
-                [m.get("machine_id") for m in machines]
-            )
-            for m in machines:
-                tags = drain_tags.get(m.get("machine_id"), {})
-                m["lifecycle"] = tags.get("lifecycle")
-                m["drain_deadline"] = tags.get("drain_deadline")
             return {
                 "action": "status",
                 "result": {"machines": machines, "count": len(machines)},
