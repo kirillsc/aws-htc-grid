@@ -194,31 +194,42 @@ module "orb_orchestrator" {
   attach_tracing_policy = true
   tracing_mode          = "Active"
 
-  # Grid-specific values override the placeholder bundled config at cold start
-  # (orb_lambda._materialize_grid_config). ORB_CONFIG_DIR is the bundled config; writable
-  # ORB dirs go under /tmp (only writable path in Lambda). ORB_ALLOW_TERMINATE_ALL is left
-  # UNSET so the fleet-wide kill switch is disabled.
+  # Grid-specific values reach ORB via its own ORB_AWS_* env-var layer at cold start
+  # (orb_lambda._materialize_grid_config). orb-py's AWSProviderConfig is a pydantic-settings
+  # BaseSettings (env_prefix="ORB_AWS_", env_nested_delimiter="__"), so ORB_AWS_REGION and
+  # ORB_AWS_STORAGE__DYNAMODB__* are consumed by ORB DIRECTLY — the bundled config.json
+  # deliberately omits region/table_prefix so these env vars win (a value in the file would be an
+  # init kwarg that, by pydantic-settings precedence, beats the env var). The template-only vars
+  # (subnet/SG/profile/AMI/type/user_data) have no field on AWSProviderConfig, so the handler
+  # substitutes them into aws_templates.json itself; they keep the ORB_AWS_ prefix only for naming
+  # consistency. ORB_CONFIG_DIR is the bundled config; writable ORB dirs go under /tmp.
+  # ORB_ALLOW_TERMINATE_ALL is left UNSET so the fleet-wide kill switch is disabled.
   environment_variables = {
     # Powertools structured logging: service name groups records; level is env-driven.
-    POWERTOOLS_SERVICE_NAME  = "orb_orchestrator"
-    LOG_LEVEL                = "INFO"
-    ORB_CONFIG_DIR           = "/var/task/orb-config"
-    ORB_PROVIDER             = "aws"
-    ORB_ROOT_DIR             = "/tmp/orb"
-    ORB_WORK_DIR             = "/tmp/orb/work"
-    ORB_LOG_DIR              = "/tmp/orb/logs"
-    ORB_CACHE_DIR            = "/tmp/orb/cache"
-    ORB_SCRIPTS_DIR          = "/tmp/orb/scripts"
-    ORB_HEALTH_DIR           = "/tmp/orb/health"
-    ORB_TABLE_PREFIX         = var.table_prefix
-    ORB_REGION               = var.region
-    ORB_TEMPLATE_ID          = var.orb_template_id
-    ORB_SUBNET_IDS           = join(",", var.worker_subnet_ids)
-    ORB_SECURITY_GROUP_IDS   = var.worker_security_group_id
-    ORB_INSTANCE_PROFILE_ARN = var.worker_instance_profile_arn
-    ORB_IMAGE_ID             = var.worker_ami_id
-    ORB_INSTANCE_TYPE        = var.worker_instance_type
-    ORB_USER_DATA_SSM_PARAM  = var.worker_user_data_ssm_param
+    POWERTOOLS_SERVICE_NAME = "orb_orchestrator"
+    LOG_LEVEL               = "INFO"
+    ORB_CONFIG_DIR          = "/var/task/orb-config"
+    ORB_PROVIDER            = "aws"
+    ORB_ROOT_DIR            = "/tmp/orb"
+    ORB_WORK_DIR            = "/tmp/orb/work"
+    ORB_LOG_DIR             = "/tmp/orb/logs"
+    ORB_CACHE_DIR           = "/tmp/orb/cache"
+    ORB_SCRIPTS_DIR         = "/tmp/orb/scripts"
+    ORB_HEALTH_DIR          = "/tmp/orb/health"
+
+    # Consumed by orb-py's AWSProviderConfig BaseSettings directly (no handler substitution).
+    ORB_AWS_REGION                          = var.region
+    ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX = var.table_prefix
+    ORB_AWS_STORAGE__DYNAMODB__REGION       = var.region
+
+    # Substituted into aws_templates.json by the handler (no ORB_AWS_* field exists for these).
+    ORB_AWS_TEMPLATE_ID          = var.orb_template_id
+    ORB_AWS_SUBNET_IDS           = join(",", var.worker_subnet_ids)
+    ORB_AWS_SECURITY_GROUP_IDS   = var.worker_security_group_id
+    ORB_AWS_INSTANCE_PROFILE_ARN = var.worker_instance_profile_arn
+    ORB_AWS_IMAGE_ID             = var.worker_ami_id
+    ORB_AWS_INSTANCE_TYPE        = var.worker_instance_type
+    ORB_AWS_USER_DATA_SSM_PARAM  = var.worker_user_data_ssm_param
   }
 
   tags = {

@@ -29,6 +29,7 @@ controller (not just a human operator) drives this handler:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import subprocess
@@ -78,10 +79,82 @@ _patch_orb_at_cold_start()
 # counted as capacity or re-terminated.
 LIVE_STATES = {"pending", "running", "stopping", "shutting-down"}
 
+# Request states that are final. get_request_status can never advance these, so syncing one
+# during reconcile just wastes a slow round-trip and makes ORB log a transition ERROR
+# ("Cannot transition request from failed to complete"). Skip them in _reconcile_requests.
+# Both spellings of cancelled are included since the exact orb-py value is unconfirmed.
+TERMINAL_REQUEST_STATES = {"complete", "completed", "failed", "cancelled", "canceled"}
+
 
 def _live_machines(machines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter ORB's machine list down to live (non-terminated) machines."""
     return [m for m in machines if m.get("status") in LIVE_STATES]
+
+
+def _enable_aws_wire_logs() -> None:
+    """Opt-in: surface botocore's raw AWS request/response DEBUG logs to CloudWatch.
+
+    orb-py's setup_logging() (run during orb() client init) hard-pins boto3/botocore/urllib3
+    to WARNING, so even with orb at DEBUG the raw AWS wire dumps never reach the handlers.
+    When ORB_DEBUG_AWS=1, re-raise those loggers to DEBUG. Call this AFTER the orb client is
+    opened, otherwise setup_logging runs later and clamps them back to WARNING.
+
+    Off by default on purpose: botocore DEBUG is very noisy (every header + full response
+    body -> CloudWatch volume/cost) and can log sensitive data (auth headers, payloads).
+    Use it for a targeted debug run, then unset the env var.
+    """
+    if os.environ.get("ORB_DEBUG_AWS") != "1":
+        return
+    for name in ("boto3", "botocore", "urllib3"):
+        logging.getLogger(name).setLevel(logging.DEBUG)
+    logger.warning(
+        "ORB_DEBUG_AWS=1: raised boto3/botocore/urllib3 to DEBUG (verbose; may log secrets)"
+    )
+
+
+async def _reconcile_requests(client: Any) -> None:
+    """Best-effort: refresh ORB's stored machine state from live cloud state.
+
+    ``list_machines()`` reads DynamoDB, which is a cache of provider state. The stored
+    machine status only advances (pending->running) when ORB reconciles a request against
+    live EC2. Normally the capacity-controller tick drives that; when the tick is paused
+    (e.g. the manual submit script disables it so it can't reap the worker mid-test),
+    ``status`` would report stale state forever and callers polling for "running" hang.
+
+    So before reading machines, enumerate ORB's requests and poll each one's status.
+    ``get_request_status`` performs a read-through sync (fetch live provider machines ->
+    reconcile -> persist refreshed status to DynamoDB), so this pulls reality into the read
+    model before we read it.
+
+    Never raises: a sync failure must not turn a status call into an error. The capacity
+    controller calls status every tick and must keep working even if reconcile fails.
+    """
+    def _is_terminal(r: dict[str, Any]) -> bool:
+        # Read defensively: orb-py's exact field name/values are unconfirmed, so accept either
+        # status/state and fall back to syncing (return False) when absent/unknown. A wrong guess
+        # is then a no-op, not a regression.
+        st = r.get("status") or r.get("state") or ""
+        return isinstance(st, str) and st.lower() in TERMINAL_REQUEST_STATES
+
+    try:
+        listed = await client.list_requests()
+        with_id = [r for r in listed.get("requests", []) if r.get("request_id")]
+    except Exception:  # noqa: BLE001 - reconcile is best-effort; fall back to stored state
+        logger.exception("status reconcile: could not list requests; returning stored state")
+        return
+    # Skip terminal requests: their state can't change, so a sync is pure cost (slow + ERROR log).
+    request_ids = [r["request_id"] for r in with_id if not _is_terminal(r)]
+    skipped_terminal = len(with_id) - len(request_ids)
+    for rid in request_ids:
+        try:
+            await client.get_request_status([rid])
+        except Exception:  # noqa: BLE001 - skip one bad request, keep syncing the rest
+            logger.warning("status reconcile: get_request_status failed", request_id=rid)
+    logger.info(
+        "status reconcile complete",
+        requests=len(request_ids),
+        skipped_terminal=skipped_terminal,
+    )
 
 # ORB wants writable work/log/cache/scripts/health dirs. In Lambda only /tmp is
 # writable, so the env points there (see CDK / Dockerfile); ensure they exist
@@ -101,23 +174,36 @@ for _var in (
 def _materialize_grid_config() -> None:
     """Render the bundled ORB config with this grid's values and point ORB at it.
 
-    The image bundles a read-only config (/var/task/orb-config) with placeholder table
-    prefix / subnet / SG / instance-profile / AMI. Terraform passes the real values via env;
-    we copy the config to a writable /tmp dir, substitute them, and repoint ORB_CONFIG_DIR.
-    This keeps ONE image usable for any grid (no per-grid image build).
+    The image bundles a read-only config (/var/task/orb-config). Grid-specific values reach
+    ORB by two routes:
+
+      * Core provider config (region + DynamoDB table prefix) is driven by ORB's OWN env-var
+        layer: orb-py's AWSProviderConfig is a pydantic-settings BaseSettings with
+        env_prefix="ORB_AWS_" and env_nested_delimiter="__", so ORB reads ORB_AWS_REGION and
+        ORB_AWS_STORAGE__DYNAMODB__{TABLE_PREFIX,REGION} directly. The bundled config.json
+        therefore leaves region/table_prefix UNSET (empty dynamodb {}); a value present in the
+        file would be passed as an init kwarg and, by pydantic-settings precedence, win over the
+        env var — defeating the point. We must NOT write those keys here.
+      * Launch-template values (subnet / SG / instance-profile / AMI / instance-type / user_data)
+        have no field on AWSProviderConfig and so no ORB_AWS_* env path. They still need manual
+        substitution into aws_templates.json, which is what the rest of this function does.
+
+    We copy the config to a writable /tmp dir, substitute the template values, and repoint
+    ORB_CONFIG_DIR. This keeps ONE image usable for any grid (no per-grid image build).
     """
     src = os.environ.get("ORB_CONFIG_DIR")
     if not src:
         return  # no bundled config dir (e.g. local/PoC use of the baked config)
 
-    # Fail loud if the grid's table prefix is missing: silently falling back to the bundled
-    # "orb-poc" placeholder would point ORB at the WRONG DynamoDB tables. In the Terraform
-    # deployment the orb_orchestrator module always sets ORB_TABLE_PREFIX.
-    table_prefix = os.environ.get("ORB_TABLE_PREFIX")
+    # Fail loud if the grid's table prefix is missing. orb-py's DynamodbStrategyConfig defaults
+    # table_prefix to "hostfactory", so an unset env var would SILENTLY point ORB at the wrong
+    # (or non-existent) DynamoDB tables. ORB reads this var itself; we only assert its presence.
+    # In the Terraform deployment the orb_orchestrator module always sets it.
+    table_prefix = os.environ.get("ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX")
     if not table_prefix:
         raise RuntimeError(
-            "ORB_TABLE_PREFIX is unset; refusing to use the bundled placeholder table prefix. "
-            "Set ORB_TABLE_PREFIX (the orb_orchestrator Terraform module sets it)."
+            "ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX is unset; refusing to fall back to orb-py's "
+            "'hostfactory' default table prefix. Set it (the orb_orchestrator Terraform module does)."
         )
 
     import json
@@ -126,18 +212,20 @@ def _materialize_grid_config() -> None:
     shutil.rmtree(dst, ignore_errors=True)
     shutil.copytree(src, dst)
 
-    region = os.environ.get("ORB_REGION", "eu-west-1")
-    subnet_ids = [s for s in os.environ.get("ORB_SUBNET_IDS", "").split(",") if s]
-    sg_ids = [s for s in os.environ.get("ORB_SECURITY_GROUP_IDS", "").split(",") if s]
-    instance_profile = os.environ.get("ORB_INSTANCE_PROFILE_ARN", "")
-    image_id = os.environ.get("ORB_IMAGE_ID", "")
-    instance_type = os.environ.get("ORB_INSTANCE_TYPE", "")
-    template_id = os.environ.get("ORB_TEMPLATE_ID", "RunInstances-OnDemand")
+    # Region for our own boto3 SSM client below. ORB resolves its region from ORB_AWS_REGION;
+    # read the same var so the SSM fetch and ORB agree.
+    region = os.environ.get("ORB_AWS_REGION", "eu-west-1")
+    subnet_ids = [s for s in os.environ.get("ORB_AWS_SUBNET_IDS", "").split(",") if s]
+    sg_ids = [s for s in os.environ.get("ORB_AWS_SECURITY_GROUP_IDS", "").split(",") if s]
+    instance_profile = os.environ.get("ORB_AWS_INSTANCE_PROFILE_ARN", "")
+    image_id = os.environ.get("ORB_AWS_IMAGE_ID", "")
+    instance_type = os.environ.get("ORB_AWS_INSTANCE_TYPE", "")
+    template_id = os.environ.get("ORB_AWS_TEMPLATE_ID", "RunInstances-OnDemand")
 
     # The worker cloud-init is large and lives in SSM; fetch it (plain text — ORB
     # base64-encodes user_data itself when building the launch template).
     user_data = ""
-    ud_param = os.environ.get("ORB_USER_DATA_SSM_PARAM")
+    ud_param = os.environ.get("ORB_AWS_USER_DATA_SSM_PARAM")
     if ud_param:
         import boto3
 
@@ -149,22 +237,9 @@ def _materialize_grid_config() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("could not load worker user_data from SSM", ssm_param=ud_param)
 
-    # config.json: table prefix (both places) + provider template_defaults subnet.
-    cfg_path = os.path.join(dst, "config.json")
-    with open(cfg_path) as f:
-        cfg = json.load(f)
-    cfg["storage"]["dynamodb_strategy"]["table_prefix"] = table_prefix
-    cfg["storage"]["dynamodb_strategy"]["region"] = region
-    for prov in cfg.get("provider", {}).get("providers", []):
-        pc = prov.get("config", {})
-        pc.setdefault("storage", {}).setdefault("dynamodb", {})
-        pc["storage"]["dynamodb"]["table_prefix"] = table_prefix
-        pc["storage"]["dynamodb"]["region"] = region
-        if subnet_ids:
-            prov.setdefault("template_defaults", {})["subnet_ids"] = subnet_ids
-    with open(cfg_path, "w") as f:
-        json.dump(cfg, f, indent=2)
-
+    # config.json is shipped grid-agnostic: region + table_prefix come from ORB_AWS_* env vars
+    # (see docstring), so there is nothing to substitute there. Only aws_templates.json needs
+    # grid values, since its template fields have no ORB_AWS_* env path.
     # aws_templates.json: fill the active RunInstances template with grid values.
     tpl_path = os.path.join(dst, "aws_templates.json")
     with open(tpl_path) as f:
@@ -207,6 +282,9 @@ async def _dispatch(event: dict[str, Any]) -> dict[str, Any]:
         )
 
     async with orb(provider="aws") as client:
+        # orb's setup_logging (run during client init above) clamps the AWS SDK loggers to
+        # WARNING; re-raise them here if ORB_DEBUG_AWS=1 so raw wire logs reach CloudWatch.
+        _enable_aws_wire_logs()
         if action == "create":
             template_id = event.get("template_id", "RunInstances-OnDemand")
             count = int(event.get("count", 1))
@@ -220,6 +298,10 @@ async def _dispatch(event: dict[str, Any]) -> dict[str, Any]:
             if request_id:
                 result = await client.get_request_status([request_id])
                 return {"action": "status", "result": result}
+            # Refresh the read model from live cloud state before listing, so callers
+            # (e.g. a submit script polling for "running") don't see stale DynamoDB state
+            # when the capacity-controller tick that normally drives reconcile is paused.
+            await _reconcile_requests(client)
             # Machine list. Default to live machines only so a controller's
             # capacity count is accurate; include_terminated=true returns the
             # full history.
