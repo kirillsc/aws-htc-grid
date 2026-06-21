@@ -79,29 +79,31 @@ class StateTableDDB:
             for x in range(0, len(entries), self.MAX_WRITE_BATCHS_SIZE)
         ]
         for ddb_batch in tasks_batches:
-            with self.state_table.batch_writer() as batch:  # batch_writer is flushed when exiting this block
-                for entry in ddb_batch:
-                    try:
+            try:
+                # batch_writer buffers items and flushes on block exit; the exit flush must be
+                # inside this try so a throttle on the final <25 items is classified, not escaped.
+                with self.state_table.batch_writer() as batch:
+                    for entry in ddb_batch:
                         batch.put_item(Item=entry)
 
-                    except ClientError as e:
-                        if e.response["Error"]["Code"] in [
-                            "ThrottlingException",
-                            "ProvisionedThroughputExceededException",
-                        ]:
-                            msg = f"DynamoDB Batch Write Failed from DynamoDB, Throttling Exception [{e}] [{traceback.format_exc()}]"
-                            logging.warning(msg)
-                            raise StateTableException(e, msg, caused_by_throttling=True)
+            except ClientError as e:
+                if e.response["Error"]["Code"] in [
+                    "ThrottlingException",
+                    "ProvisionedThroughputExceededException",
+                ]:
+                    msg = f"DynamoDB Batch Write Failed from DynamoDB, Throttling Exception [{e}] [{traceback.format_exc()}]"
+                    logging.warning(msg)
+                    raise StateTableException(e, msg, caused_by_throttling=True)
 
-                        else:
-                            msg = f"DynamoDB Batch Write Failed from DynamoDB Exception [{e}] [{traceback.format_exc()}]"
-                            logging.error(msg)
-                            raise Exception(e)
+                else:
+                    msg = f"DynamoDB Batch Write Failed from DynamoDB Exception [{e}] [{traceback.format_exc()}]"
+                    logging.error(msg)
+                    raise Exception(e)
 
-                    except Exception as e:
-                        msg = f"DynamoDB Batch Write Failed from DynamoDB Exception [{e}] [{traceback.format_exc()}]"
-                        logging.error(msg)
-                        raise Exception(e)
+            except Exception as e:
+                msg = f"DynamoDB Batch Write Failed from DynamoDB Exception [{e}] [{traceback.format_exc()}]"
+                logging.error(msg)
+                raise Exception(e)
 
     def get_task_by_id(self, task_id, consistent_read=False):
         """
