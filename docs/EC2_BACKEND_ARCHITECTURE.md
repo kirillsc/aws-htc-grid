@@ -40,10 +40,10 @@ churning when upgrading to the selectable layout.
 ## 2. Architecture
 
 ```
-                       pending_tasks_ddb (SQS backlog) ── scaling_metrics Lambda (control plane, unchanged)
-                                  │
+                       SQS task queue(s) ApproximateNumberOfMessages (backlog)
+                                  │  (read directly; scaling_metrics/pending_tasks_ddb is EKS-only)
    EventBridge rate(1 min) ─► capacity_controller Lambda (NEW, outside VPC)
-                                  │  reads backlog (CloudWatch) + ORB live count; reconciles
+                                  │  reads backlog (SQS) + ORB live count; reconciles
                                   │  single-flight via reserved concurrency = 1
                                   │  Lambda→Lambda Invoke
                                   ▼
@@ -94,13 +94,17 @@ churning when upgrading to the selectable layout.
   no ECR repo, no image-build step.
 - Least-privilege role: DDB RW on the 3 tables, EC2 launch-template + run/terminate/describe,
   SSM AMI read, KMS, **`iam:PassRole`** on the worker role, and SSM read of the worker user-data.
-- The handler (`orb_lambda.py`) rewrites the bundled ORB config at cold start from env vars (table
-  prefix, subnet, SG, instance profile, AMI, instance type, **and the worker user_data fetched from
-  SSM**), so one build works for any grid. `ORB_ALLOW_TERMINATE_ALL` is unset (kill switch disabled).
+- Grid-specific config reaches ORB two ways at cold start, so one build works for any grid:
+  region + DynamoDB table prefix are read by **orb-py's own `ORB_AWS_*` env layer**
+  (`AWSProviderConfig` is a pydantic-settings `BaseSettings`: `ORB_AWS_REGION`,
+  `ORB_AWS_STORAGE__DYNAMODB__{TABLE_PREFIX,REGION}`), while the launch-template values that have
+  no `ORB_AWS_*` field — subnet, SG, instance profile, AMI, instance type, **and the worker
+  user_data fetched from SSM** — are substituted into `aws_templates.json` by the handler
+  (`orb_lambda._materialize_grid_config`). `ORB_ALLOW_TERMINATE_ALL` is unset (kill switch disabled).
 
 **`capacity_controller/`** — the scaling brain:
-- EventBridge `rate(1 minute)` → Lambda (outside VPC — it only calls Lambda + CloudWatch APIs).
-- Reads backlog (`pending_tasks_ddb`) + ORB **live** machine count, computes
+- EventBridge `rate(1 minute)` → Lambda (outside VPC — it only calls regional AWS APIs: Lambda, SQS, DynamoDB, EC2/SSM).
+- Reads backlog directly from SQS (`get_queue_length` → `ApproximateNumberOfMessages`) + ORB **live** machine count, computes
   `desired = clamp(ceil(backlog / target_pending_per_instance), min, max)`, then invokes the
   orchestrator `create` (scale-up) or `terminate` oldest-first (scale-down).
 - Single-flight via the Lambda's `reserved_concurrent_executions = 1` (ADR-001) prevents
@@ -122,6 +126,7 @@ the agent config and the control-plane Lambdas (there is no in-cluster InfluxDB)
 | Worker host | Pod on managed node group | EC2 instance, Docker Compose |
 | Pair isolation | pod `shareProcessNamespace` | per-pair `network_mode`+`pid: service:rie-i` |
 | Scaling | KEDA + Cluster Autoscaler | capacity_controller Lambda + ORB orchestrator |
+| Demand signal | `scaling_metrics` → CloudWatch `pending_tasks_ddb` (KEDA reads it) | controller reads SQS `ApproximateNumberOfMessages` directly (`scaling_metrics` not deployed) |
 | Identity | IRSA (`htc-agent-sa`) | EC2 instance profile (same permission policy) |
 | Config | ConfigMap `agent-configmap` | SSM SecureString → `/etc/agent` |
 | Container logs | FluentBit → `/aws/eks/<cluster>/aws-fluentbit-logs` | awslogs → `/aws/ec2/<cluster>/worker-logs` |
@@ -129,7 +134,8 @@ the agent config and the control-plane Lambdas (there is no in-cluster InfluxDB)
 | Capacity API | n/a | ORB `RunInstances-OnDemand` (EC2 Fleet/Spot deferred) |
 
 Shared & unchanged: VPC + endpoints, SQS, DynamoDB, Redis, S3, Cognito, API Gateway, the
-control-plane Lambdas, and the `grid_errors-<proj>` application error log.
+control-plane Lambdas (except `scaling_metrics`, now EKS-only), and the `grid_errors-<proj>`
+application error log.
 
 ---
 
@@ -181,8 +187,9 @@ Knobs (in `ec2_worker_grid_config.json.tpl` / root variables): `ec2_instance_typ
 
 ### Bugs found and fixed during the live test
 1. **ORB config table-prefix / IDs** were hardcoded to the PoC (`orb-poc`, PoC subnet/SG). Fixed by
-   the handler rewriting the bundled config from env at cold start (table prefix, subnet, SG,
-   instance profile, AMI, instance type).
+   driving the table prefix + region through orb-py's own `ORB_AWS_*` env layer (so the bundled
+   `config.json` ships grid-agnostic) and having the handler substitute the template-only values
+   (subnet, SG, instance profile, AMI, instance type) into `aws_templates.json` at cold start.
 2. **Worker got no user-data** — ORB's `RunInstances` template had no `user_data`. Fixed by storing
    the rendered cloud-init in SSM and injecting it into the template `user_data` field at cold start.
 3. **Control-plane Lambdas crashed (502)** initializing the InfluxDB perf tracker. Fixed by passing
@@ -190,7 +197,8 @@ Knobs (in `ec2_worker_grid_config.json.tpl` / root variables): `ec2_instance_typ
 4. **node_drainer empty-`Resource` IAM error** — gated the node_drainer (EKS-only) off via an
    explicit `enable_node_drainer` flag.
 5. **capacity_controller hung (120 s timeout)** — it was VPC-attached but the VPC has no `lambda`
-   endpoint/NAT. Fixed by running the controller outside the VPC (it only calls Lambda + CloudWatch).
+   endpoint/NAT. Fixed by running the controller outside the VPC (it only calls regional AWS APIs —
+   Lambda, SQS, DynamoDB, EC2/SSM).
    (At the time this also wedged a DynamoDB single-flight lock until its TTL; that lock was later
    removed in favour of `reserved_concurrent_executions = 1` — ADR-001.)
 6. **compose-plugin staging** `null_resource` didn't `mkdir` its cache dir. Fixed.
@@ -256,23 +264,23 @@ htc-grid/
 │   │   │
 │   │   └── capacity_controller/                          + NEW MODULE: queue-driven scaling controller
 │   │       ├── main.tf                                   + EventBridge tick + Lambda (reserved concurrency=1) + IAM
-│   │       └── variables.tf                              + orchestrator fn, metric dims, min/max/target/interval
+│   │       └── variables.tf                              + orchestrator fn, task queue (service/config/name) + SQS CMK, min/max/target/interval
 │   │
 │   └── (image_repository/terraform/*, init_grid/cloudformation/grid_state.yaml ~ pre-existing local mods, not part of this work)
 │
 ├── source/compute_plane/
 │   ├── orb_orchestrator/                                 + NEW: ORB orchestrator ZIP-build source (no Docker/ECR)
-│   │   ├── orb_lambda.py                                 + create/status/terminate dispatch + cold-start config rewrite
+│   │   ├── orb_lambda.py                                 + create/status/terminate dispatch + cold-start template substitution
 │   │   ├── build.sh                                      + stage handler+config, pip-install orb-py, apply 4 patches → .build
 │   │   ├── requirements.txt                              + orb-py==1.6.2
 │   │   ├── .gitignore                                    + ignore .build/ (zip staging dir)
 │   │   ├── patches/apply_orb_patches.py                  + the 4 mandatory orb-py DynamoDB-backend fixes (target-dir aware, idempotent)
-│   │   ├── config/config.json                            + ORB storage(dynamodb)+provider config (placeholders)
+│   │   ├── config/config.json                            + ORB storage(dynamodb)+provider config (grid-agnostic; region/table_prefix via ORB_AWS_* env)
 │   │   ├── config/aws_templates.json                     + ORB launch templates (RunInstances-OnDemand active)
 │   │   └── docs/ORB_DYNAMODB_{BUG_REPORT,PATCHES}.md      + diagnosis + condensed patch table
 │   │
 │   └── python/lambda/capacity_controller/
-│       └── ec2_capacity_controller.py                    + controller logic: read backlog+live, reconcile, invoke orchestrator
+│       └── ec2_capacity_controller.py                    + controller logic: read backlog (SQS get_queue_length)+live, reconcile, invoke orchestrator
 │
 ├── examples/configurations/
 │   ├── ec2_worker_grid_config.json.tpl                   + NEW: ec2-backend grid config template (worker_backend=ec2)
@@ -292,6 +300,10 @@ htc-grid/
 
 ## 8. Q&A (design rationale)
 
+> For an operational / scale-down FAQ (busy detection, drain deadlines, the ORB seam, failure
+> modes), see [`EC2_BACKEND_FAQ.md`](./EC2_BACKEND_FAQ.md). The questions below cover module-layout
+> rationale.
+
 **Why is `orb_orchestrator` a sibling of `control_plane`, not inside it?**
 `control_plane` is the shared, always-on layer (deploys on both backends); ORB is an EC2-only
 worker-plane scaler that *depends on* `compute_plane_ec2` outputs. Nesting it in `control_plane`
@@ -302,9 +314,12 @@ would couple a shared module to an optional feature and invert the dependency in
 when it's needed. ORB is the EC2 analogue of KEDA+Cluster-Autoscaler, so it sits beside
 `compute_plane_ec2`.
 
-**Is `scaling_metrics` EventBridge-driven?**
-Yes — `rate(1 minute)`, same as `capacity_controller`. It only *publishes* `pending_tasks_ddb`;
-on EKS KEDA consumes it, on EC2 the `capacity_controller` does.
+**Is `scaling_metrics` used on the ec2 backend?**
+No — it is **EKS-only** now (gated by `enable_scaling_metrics = worker_backend == "eks"`, the
+same pattern as `node_drainer`). It is an EventBridge `rate(1 minute)` Lambda that reads the SQS
+backlog and `put_metric_data` publishes it as `pending_tasks_ddb` for KEDA to consume. The ec2
+`capacity_controller` reads the same `ApproximateNumberOfMessages` straight from SQS instead, so
+the CloudWatch republish hop (and that Lambda) is not deployed on ec2.
 
 **Why gate only `node_drainer`, not all of EKS?**
 All of EKS *is* gated — `compute_plane`/`htc_agent` are `count=0` on EC2. `node_drainer` is the one

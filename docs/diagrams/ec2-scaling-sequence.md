@@ -15,7 +15,9 @@ sequenceDiagram
     autonumber
     box rgb(232,245,233) Scaling control
         participant CTL as capacity_controller<br/>Lambda (concurrency=1)
-        participant CW as CloudWatch<br/>(pending_tasks_ddb)
+    end
+    box rgb(225,245,254) Task dataplane
+        participant SQSQ as SQS task queue(s)
     end
     box rgb(255,243,224) ORB
         participant ORB as orb_orchestrator<br/>Lambda (ORB)
@@ -24,8 +26,8 @@ sequenceDiagram
         participant EC2 as EC2 / worker instance
     end
 
-    CTL->>CW: read backlog (pending_tasks_ddb)
-    CW-->>CTL: backlog
+    CTL->>SQSQ: read backlog (GetQueueAttributes)
+    SQSQ-->>CTL: ApproximateNumberOfMessages
     CTL->>ORB: status (how many live?)
     ORB-->>CTL: live count
     Note over CTL: desired = clamp(ceil(backlog / target_per_instance), min, max)
@@ -52,7 +54,6 @@ sequenceDiagram
     end
     box rgb(232,245,233) Scaling control
         participant CTL as capacity_controller<br/>Lambda (concurrency=1)
-        participant CW as CloudWatch<br/>(pending_tasks_ddb)
     end
     box rgb(255,243,224) ORB
         participant ORB as orb_orchestrator<br/>Lambda (ORB)
@@ -63,13 +64,11 @@ sequenceDiagram
         participant SQS as SQS + DDB state
     end
 
-    Note over CW: scaling_metrics Lambda (unchanged)<br/>publishes backlog every minute
-
     Note over EB,CTL: reserved_concurrent_executions = 1 →<br/>at most one tick runs at a time (overlap is throttled + retried)
 
     EB->>CTL: invoke tick
-    CTL->>CW: GetMetricData pending_tasks_ddb
-    CW-->>CTL: backlog
+    CTL->>SQS: GetQueueAttributes (ApproximateNumberOfMessages)
+    SQS-->>CTL: backlog
     CTL->>ORB: invoke {"action":"status"}
     ORB->>DDB: list machines (filter live)
     DDB-->>ORB: live machines
@@ -100,14 +99,15 @@ sequenceDiagram
 
 ## Notes
 
-- **`scaling_metrics` Lambda (demand signal, unchanged from EKS).** A pre-existing
-  control-plane Lambda fired by its own EventBridge `rate(1 min)`. Each tick it reads the
-  queue length (count of PENDING tasks via the queue_manager over the SQS/DDB state) and
-  `put_metric_data` publishes it as the CloudWatch metric `pending_tasks_ddb`
-  (namespace/dimension from env). It only *produces* the metric and makes no scaling
-  decision: on EKS, KEDA consumes it; on EC2, the `capacity_controller` does. Shared by
-  both backends, so it is reused as-is.
-- **Demand vs supply.** `pending_tasks_ddb` is the demand signal; ORB's live machine count
+- **Backlog read directly from SQS (no CloudWatch hop).** The controller reads the demand
+  signal straight from the task queue — `queue_manager(...).get_queue_length()`, i.e. SQS
+  `ApproximateNumberOfMessages` (summed across all priority queues for PrioritySQS). This is
+  the *same* number the EKS-only `scaling_metrics` Lambda republishes to CloudWatch as
+  `pending_tasks_ddb`; reading the queue directly drops a Lambda and a CloudWatch round-trip
+  from the EC2 scaling path, so backlog changes are seen within one tick instead of stacking
+  two ~1-min schedules plus CloudWatch ingestion lag. `scaling_metrics` / `pending_tasks_ddb`
+  remain **EKS-only** (KEDA consumes the metric there); they are not deployed on the ec2 backend.
+- **Demand vs supply.** The SQS backlog is the demand signal; ORB's live machine count
   is supply. The controller reconciles to
   `desired = clamp(ceil(backlog / target_pending_per_instance), min, max)`.
 - **Single-flight via `reserved_concurrent_executions = 1`** (ADR-001). At most one tick

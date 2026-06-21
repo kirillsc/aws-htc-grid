@@ -254,8 +254,9 @@ at least once (`status`), plus `create`/`terminate` when scaling.
   not just this one.
 - **IAM blast radius.** The orchestrator owns the 3 DynamoDB state tables, EC2
   RunInstances/TerminateInstances, `iam:PassRole`, and a KMS key. The controller needs only
-  `lambda:InvokeFunction` + `cloudwatch:GetMetricData`. Merging would grant the metric path the
-  full EC2-launch IAM.
+  `lambda:InvokeFunction`, `sqs:GetQueueAttributes`/`GetQueueUrl` (read the backlog),
+  `dynamodb:Query` (busy set), and EC2 tag + `ssm:SendCommand` (drain). Merging would grant the
+  scaling path the full EC2-launch IAM.
 - **Concurrency model.** The controller is pinned to `reserved_concurrent_executions = 1`
   (ADR-001). The orchestrator must not be — it may be invoked concurrently (e.g. a status read
   while a create/terminate is in flight). One merged function cannot hold both policies.

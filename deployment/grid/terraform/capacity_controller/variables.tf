@@ -38,23 +38,38 @@ variable "orb_template_id" {
   default     = "RunInstances-OnDemand"
 }
 
-variable "metric_namespace" {
-  description = "CloudWatch namespace of the backlog metric (pending_tasks_ddb)"
+variable "task_queue_service" {
+  description = "Task queue backend service (SQS or PrioritySQS)"
   type        = string
 }
 
-variable "metric_name" {
-  description = "CloudWatch metric name for the backlog"
+variable "task_queue_config" {
+  description = "Task queue client config JSON (e.g. priorities count for PrioritySQS)"
   type        = string
 }
 
-variable "metric_dimension_name" {
-  description = "Backlog metric dimension name"
+variable "tasks_queue_name" {
+  description = "Name of the (first) SQS task queue read for the backlog"
   type        = string
 }
 
-variable "metric_dimension_value" {
-  description = "Backlog metric dimension value (cluster name)"
+variable "sqs_queue" {
+  description = "Base name of the SQS task queue(s); the controller reads ApproximateNumberOfMessages (used as the IAM resource prefix to cover all priority queues)"
+  type        = string
+}
+
+variable "sqs_kms_key_arn" {
+  description = "KMS CMK ARN encrypting the task queue(s) (kms:Decrypt is required to read queue attributes)"
+  type        = string
+}
+
+variable "error_log_group" {
+  description = "Global error CloudWatch log group name (read at import by the shared queue DAL's grid_error_logger)"
+  type        = string
+}
+
+variable "error_logging_stream" {
+  description = "Global error CloudWatch log stream name (read at import by the shared queue DAL's grid_error_logger)"
   type        = string
 }
 

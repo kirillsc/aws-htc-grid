@@ -23,8 +23,8 @@ flowchart TB
 
     subgraph CTL["capacity_controller Lambda"]
         direction TB
-        S1["Stage 1 — Decide / Reconcile<br/>read backlog (CloudWatch)<br/>read live count (orb_client.list_live)<br/>desired = clamp(ceil(backlog / target), min, max)"]
-        S2["Stage 2 — Drain core (EC2-level, provider-independent)<br/>cordon: SSM compose stop + write draining tags<br/>idle-detect: heartbeat query (gsi_ttl_index)<br/>sweep: terminate when idle or past deadline, uncordon to reclaim"]
+        S1["Decide (every tick)<br/>read backlog (SQS GetQueueAttributes)<br/>read live count (orb_client.list_live) + drain tags (EC2)<br/>read busy set (heartbeat query, gsi_ttl_index)<br/>desired = clamp(ceil(backlog / target), min, max)"]
+        S2["Reconcile — 3 code stages, EC2-level drain is provider-independent<br/>stage 1 sweep: terminate idle/expired draining, reclaim on rebound, re-stop still-busy<br/>stage 2 scale-up: create the remaining deficit<br/>stage 3 scale-down: cordon surplus (SSM compose stop + write draining tags)"]
         S1 --> S2
     end
 
@@ -33,14 +33,14 @@ flowchart TB
 
     ORB["ORB orchestrator (orb_client)<br/>list_live / create / terminate<br/>picks RunInstances / EC2Fleet / ASG per request"]
 
-    CW["CloudWatch<br/>pending_tasks_ddb"] -.backlog.-> S1
+    SQSB["SQS task queue(s)<br/>ApproximateNumberOfMessages"] -.backlog.-> S1
     DDB["DynamoDB gsi_ttl_index<br/>live-task heartbeat"] -.busy set.-> S2
     SSM["SSM + EC2 tags<br/>on worker instances"] -.cordon / drain-state.-> S2
     ORB --> EC2["EC2 worker fleet"]
 ```
 
-The drain core (Stage 2) is EC2-level and provider-agnostic: it cordons and waits for idle, then
-tells ORB to terminate the idle ids. ORB owns the **API choice** (RunInstances / EC2Fleet / ASG,
+The drain core (the cordon in scale-down plus the sweep) is EC2-level and provider-agnostic: it
+cordons and waits for idle, then tells ORB to terminate the idle ids. ORB owns the **API choice** (RunInstances / EC2Fleet / ASG,
 possibly different per request) and decrements the right request on terminate — so the **graceful**
 logic is universal and only the **kill** is API-specific, handled inside ORB.
 
@@ -54,7 +54,7 @@ sequenceDiagram
     end
     box rgb(232,245,233) Scaling control (controller owns drain)
         participant CTL as capacity_controller<br/>Lambda (concurrency=1)
-        participant CW as CloudWatch<br/>(pending_tasks_ddb)
+        participant SQSQ as SQS task queue(s)
         participant DDB as DynamoDB state<br/>gsi_ttl_index
     end
     box rgb(255,243,224) ORB
@@ -66,22 +66,23 @@ sequenceDiagram
     end
 
     EB->>CTL: invoke tick
-    CTL->>CW: GetMetricData pending_tasks_ddb
-    CW-->>CTL: backlog
+    CTL->>SQSQ: GetQueueAttributes (ApproximateNumberOfMessages)
+    SQSQ-->>CTL: backlog
     CTL->>ORB: list_live
     ORB-->>CTL: live machines (id, created_at)
     CTL->>EC2: DescribeInstances (read htc lifecycle / drain_deadline tags)
     EC2-->>CTL: drain state per instance
+    CTL->>DDB: query live tasks (processing AND heartbeat in future)
+    DDB-->>CTL: task_owner per live task, mapped to busy instance set
+    Note over CTL: busy set read every tick (sweep needs it too);<br/>None if state table throttling
     Note over CTL: desired = clamp(ceil(backlog / target), min, max)<br/>active = live minus draining
 
     alt desired < active  (surplus, pick victims)
-        CTL->>DDB: query live tasks (processing AND heartbeat in future)
-        DDB-->>CTL: task_owner per live task, mapped to instance id
         Note over CTL: victims = active minus desired, idle first then oldest
         CTL->>EC2: CreateTags lifecycle=draining, drain_deadline
         CTL->>SSM: SendCommand docker compose stop
-        SSM->>EC2: SIGTERM agents, finish in-flight task, stop claiming
-        Note over CTL: returns now, no blocking, terminate happens on a later tick
+        SSM->>EC2: SIGTERM agents (caught ~64ms, drain in ~10s) — RIE ignores SIGTERM, rides stop_grace_period
+        Note over CTL: returns now, no blocking — send_command is fire-and-forget,<br/>terminate happens on a later tick gated on the worker going idle
     end
 ```
 
@@ -92,7 +93,7 @@ sequenceDiagram
     autonumber
     box rgb(232,245,233) Scaling control
         participant CTL as capacity_controller
-        participant CW as CloudWatch
+        participant SQSQ as SQS task queue(s)
         participant DDB as DynamoDB gsi_ttl_index
     end
     box rgb(255,243,224) ORB
@@ -103,11 +104,12 @@ sequenceDiagram
         participant SSM as SSM
     end
 
-    CTL->>CW: backlog
+    CTL->>SQSQ: GetQueueAttributes (backlog)
     CTL->>ORB: list_live
     CTL->>EC2: DescribeInstances (drain tags)
     EC2-->>CTL: some instances tagged draining
     CTL->>DDB: query live tasks, build busy instance set
+    Note over CTL: busy set is None if the state table is throttling
 
     loop each draining instance (oldest first)
         alt backlog rebounded (deficit > 0)
@@ -121,6 +123,8 @@ sequenceDiagram
         else still busy (cordon may have half-applied)
             Note over CTL: re-issue compose stop (idempotent), check again next tick
             CTL->>SSM: SendCommand docker compose stop
+        else busy unknown (state table throttling) AND not past deadline
+            Note over CTL: cannot tell if idle; leave tagged, re-evaluate next tick<br/>(deadline still forces eventual termination)
         end
     end
 ```

@@ -201,6 +201,7 @@ module "control_plane" {
   api_gateway_version                           = var.api_gateway_version
   eks_managed_node_groups                       = try(module.compute_plane[0].eks_managed_node_groups, {})
   enable_node_drainer                           = var.worker_backend == "eks"
+  enable_scaling_metrics                        = var.worker_backend == "eks"
   tasks_queue_name                              = local.tasks_queue_name
   namespace_metrics                             = var.namespace_metrics
   dimension_name_metrics                        = var.dimension_name_metrics
@@ -398,10 +399,13 @@ module "capacity_controller" {
   orchestrator_function_name  = module.orb_orchestrator[0].function_name
   orchestrator_function_arn   = module.orb_orchestrator[0].function_arn
   orb_template_id             = "RunInstances-OnDemand"
-  metric_namespace            = var.namespace_metrics
-  metric_name                 = local.metrics_name
-  metric_dimension_name       = var.dimension_name_metrics
-  metric_dimension_value      = local.cluster_name
+  task_queue_service          = var.task_queue_service
+  task_queue_config           = var.task_queue_config
+  tasks_queue_name            = local.tasks_queue_name
+  sqs_queue                   = local.sqs_queue
+  sqs_kms_key_arn             = module.control_plane.htc_task_queue_key_arn
+  error_log_group             = local.error_log_group
+  error_logging_stream        = local.error_logging_stream
   min_instances               = var.orb_min_instances
   max_instances               = var.orb_max_instances
   target_pending_per_instance = var.orb_target_pending_per_instance

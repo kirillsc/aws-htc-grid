@@ -5,7 +5,7 @@
 """HTC-Grid EC2 capacity controller.
 
 EventBridge invokes this on a fixed interval. Each tick it:
-  1. reads the backlog metric (pending_tasks_ddb, emitted by scaling_metrics);
+  1. reads the backlog directly from the task queue (SQS ApproximateNumberOfMessages);
   2. reads live capacity from ORB (orb_client.list_live) + drain tags from EC2;
   3. computes desired instance count = clamp(ceil(backlog / target_per_instance), MIN, MAX);
   4. reconciles: sweep draining instances, scale up (orb_client.create), or scale down (cordon).
@@ -32,9 +32,9 @@ import math
 import os
 import time
 
-import boto3
 from aws_lambda_powertools import Logger
 
+from api.queue_manager import queue_manager
 from api.state_table_manager import state_table_manager
 
 import drain
@@ -43,54 +43,36 @@ import orb_client
 logger = Logger(service=os.environ.get("POWERTOOLS_SERVICE_NAME", "capacity_controller"))
 
 REGION = os.environ["REGION"]
-METRIC_NAMESPACE = os.environ["METRIC_NAMESPACE"]
-METRIC_NAME = os.environ["METRIC_NAME"]
-METRIC_DIMENSION_NAME = os.environ["METRIC_DIMENSION_NAME"]
-METRIC_DIMENSION_VALUE = os.environ["METRIC_DIMENSION_VALUE"]
 MIN_INSTANCES = int(os.environ.get("MIN_INSTANCES", "0"))
 MAX_INSTANCES = int(os.environ.get("MAX_INSTANCES", "5"))
 TARGET_PER_INSTANCE = max(1, int(os.environ.get("TARGET_PENDING_PER_INSTANCE", "4")))
+
+# Task queue, read directly for the backlog (SQS ApproximateNumberOfMessages). This is the
+# same number scaling_metrics used to republish to CloudWatch — read here without the hop.
+TASK_QUEUE_SERVICE = os.environ["TASK_QUEUE_SERVICE"]
+TASK_QUEUE_CONFIG = os.environ.get("TASK_QUEUE_CONFIG", "{}")
+TASKS_QUEUE_NAME = os.environ["TASKS_QUEUE_NAME"]
 
 # State table, used to detect which workers are busy (heartbeat-based, same as ttl_checker).
 STATE_TABLE_NAME = os.environ["STATE_TABLE_NAME"]
 STATE_TABLE_SERVICE = os.environ.get("STATE_TABLE_SERVICE", "DynamoDB")
 STATE_TABLE_CONFIG = os.environ.get("STATE_TABLE_CONFIG", "{}")
 
-cloudwatch = boto3.client("cloudwatch", region_name=REGION)
+task_queue = queue_manager(
+    TASK_QUEUE_SERVICE, TASK_QUEUE_CONFIG, TASKS_QUEUE_NAME, REGION
+)
 state_table = state_table_manager(
     STATE_TABLE_SERVICE, STATE_TABLE_CONFIG, STATE_TABLE_NAME, REGION
 )
 
 
 def _read_backlog() -> float:
-    """Most recent value of the backlog metric (pending tasks)."""
-    end = int(time.time())
-    resp = cloudwatch.get_metric_data(
-        MetricDataQueries=[
-            {
-                "Id": "backlog",
-                "MetricStat": {
-                    "Metric": {
-                        "Namespace": METRIC_NAMESPACE,
-                        "MetricName": METRIC_NAME,
-                        "Dimensions": [
-                            {"Name": METRIC_DIMENSION_NAME, "Value": METRIC_DIMENSION_VALUE}
-                        ],
-                    },
-                    "Period": 60,
-                    "Stat": "Average",
-                },
-                "ReturnData": True,
-            }
-        ],
-        StartTime=end - 600,
-        EndTime=end,
-        ScanBy="TimestampDescending",
-    )
-    # get_metric_data omits empty buckets, so values[0] is the most recent real datapoint
-    # (the scaling_metrics Lambda emits pending_tasks_ddb every minute).
-    values = resp["MetricDataResults"][0].get("Values", [])
-    return float(values[0]) if values else 0.0
+    """Pending tasks, read straight from the task queue (SQS ApproximateNumberOfMessages).
+
+    For PrioritySQS, queue_manager returns QueuePrioritySQS whose get_queue_length() sums
+    the backlog across every priority queue, so this works unchanged for both backends.
+    """
+    return float(task_queue.get_queue_length())
 
 
 def _machine_age_key(m: dict):

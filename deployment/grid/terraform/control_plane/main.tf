@@ -18,6 +18,10 @@ locals {
   # output and would create a module dependency cycle / unknown-count at plan time.
   node_drainer_enabled = var.enable_node_drainer ? 1 : 0
 
+  # scaling_metrics publishes the backlog to CloudWatch for KEDA on the eks backend only;
+  # the ec2 capacity_controller reads SQS directly and does not need it.
+  scaling_metrics_enabled = var.enable_scaling_metrics ? 1 : 0
+
   default_kms_key_admin_arns = [
     data.aws_caller_identity.current.arn,
     "arn:${local.partition}:iam::${local.account_id}:root"

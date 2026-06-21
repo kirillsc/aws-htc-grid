@@ -305,6 +305,12 @@ variable "enable_node_drainer" {
   default     = true
 }
 
+variable "enable_scaling_metrics" {
+  description = "Create the scaling_metrics Lambda that publishes the backlog (pending_tasks_ddb) to CloudWatch. Only the eks worker backend needs it (KEDA scales off that metric); on the ec2 backend the capacity_controller reads SQS directly instead."
+  type        = bool
+  default     = true
+}
+
 variable "lambda_configuration_s3_source" {
   description = "The Lambda Layer S3 bucket source"
   type        = string

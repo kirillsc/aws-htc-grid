@@ -28,10 +28,10 @@ locals {
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 
-# Controller permissions: invoke orchestrator, read backlog metric.
+# Controller permissions: invoke orchestrator, read backlog from SQS, query state table, drain.
 resource "aws_iam_policy" "controller" {
   name        = "capacity-controller-${var.suffix}"
-  description = "Capacity controller: invoke ORB orchestrator, read backlog metric"
+  description = "Capacity controller: invoke ORB orchestrator, read SQS backlog, query state table, drain instances"
   policy      = <<EOF
 {
   "Version": "2012-10-17",
@@ -43,9 +43,15 @@ resource "aws_iam_policy" "controller" {
       "Effect": "Allow"
     },
     {
-      "Sid": "ReadBacklogMetric",
-      "Action": ["cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics", "cloudwatch:ListMetrics"],
-      "Resource": "*",
+      "Sid": "ReadBacklogQueue",
+      "Action": ["sqs:GetQueueUrl", "sqs:GetQueueAttributes"],
+      "Resource": "arn:${local.partition}:sqs:${var.region}:${local.account_id}:${var.sqs_queue}*",
+      "Effect": "Allow"
+    },
+    {
+      "Sid": "DecryptQueue",
+      "Action": ["kms:Decrypt", "kms:DescribeKey"],
+      "Resource": "${var.sqs_kms_key_arn}",
       "Effect": "Allow"
     },
     {
@@ -95,6 +101,7 @@ module "capacity_controller" {
       pip_requirements = "../../../source/compute_plane/python/lambda/capacity_controller/requirements.txt"
       patterns = [
         "!tests/.*",
+        "!test_.*\\.py",
         "!.*__pycache__.*",
         "!.*\\.pyc",
       ]
@@ -137,10 +144,10 @@ module "capacity_controller" {
   number_of_policies = 1
   policies           = [aws_iam_policy.controller.arn]
 
-  # NOT VPC-attached: the controller only calls the Lambda + CloudWatch APIs (no in-VPC
-  # resources). The htc VPC has no NAT and no 'lambda' interface endpoint, so a VPC-attached
-  # controller would hang invoking the orchestrator. Running outside the VPC (like the orchestrator)
-  # gives it direct AWS API access.
+  # NOT VPC-attached: the controller only calls regional AWS APIs — Lambda, SQS, DynamoDB,
+  # EC2/SSM (no in-VPC resources). The htc VPC has no NAT and no 'lambda' interface endpoint, so a
+  # VPC-attached controller would hang invoking the orchestrator. Running outside the VPC (like the
+  # orchestrator) gives it direct AWS API access.
 
   attach_tracing_policy = true
   tracing_mode          = "Active"
@@ -148,16 +155,18 @@ module "capacity_controller" {
   environment_variables = {
     # Powertools structured logging: service name groups this Lambda's records; level is
     # env-driven (no code change to switch to DEBUG).
-    POWERTOOLS_SERVICE_NAME     = "capacity_controller"
-    LOG_LEVEL                   = "INFO"
-    REGION                      = var.region
-    DRAIN_DEADLINE_SEC          = tostring(var.drain_deadline_sec)
-    ORCHESTRATOR_FUNCTION_NAME  = var.orchestrator_function_name
-    ORB_TEMPLATE_ID             = var.orb_template_id
-    METRIC_NAMESPACE            = var.metric_namespace
-    METRIC_NAME                 = var.metric_name
-    METRIC_DIMENSION_NAME       = var.metric_dimension_name
-    METRIC_DIMENSION_VALUE      = var.metric_dimension_value
+    POWERTOOLS_SERVICE_NAME    = "capacity_controller"
+    LOG_LEVEL                  = "INFO"
+    REGION                     = var.region
+    DRAIN_DEADLINE_SEC         = tostring(var.drain_deadline_sec)
+    ORCHESTRATOR_FUNCTION_NAME = var.orchestrator_function_name
+    ORB_TEMPLATE_ID            = var.orb_template_id
+    TASK_QUEUE_SERVICE         = var.task_queue_service
+    TASK_QUEUE_CONFIG          = var.task_queue_config
+    TASKS_QUEUE_NAME           = var.tasks_queue_name
+    # Read at import by the shared queue DAL's grid_error_logger (no agent config file in-Lambda).
+    ERROR_LOG_GROUP             = var.error_log_group
+    ERROR_LOGGING_STREAM        = var.error_logging_stream
     MIN_INSTANCES               = tostring(var.min_instances)
     MAX_INSTANCES               = tostring(var.max_instances)
     TARGET_PENDING_PER_INSTANCE = tostring(var.target_pending_per_instance)
