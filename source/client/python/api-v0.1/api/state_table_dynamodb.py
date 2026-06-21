@@ -210,9 +210,9 @@ class StateTableDDB:
                 raise Exception(e)
 
         except Exception as e:
-            msg = f"{__name__} Failed. Exception: [{e.response['Error']}]"
+            msg = f"{__name__} Failed. Exception: [{e}] {traceback.format_exc()}"
             logging.error(msg)
-            raise e
+            raise
 
     def query_live_tasks(self):
         """
@@ -268,9 +268,9 @@ class StateTableDDB:
                 raise Exception(e)
 
         except Exception as e:
-            msg = f"{__name__} Failed. Exception: [{e.response['Error']}]"
+            msg = f"{__name__} Failed. Exception: [{e}] {traceback.format_exc()}"
             logging.error(msg)
-            raise e
+            raise
 
     def retry_task(self, task_id, new_retry_count):
         """
@@ -328,9 +328,9 @@ class StateTableDDB:
                 raise Exception(e)
 
         except Exception as e:
-            msg = f"{__name__} Failed. Exception: [{e.response['Error']}]"
+            msg = f"{__name__} Failed. Exception: [{e}] {traceback.format_exc()}"
             logging.error(msg)
-            raise e
+            raise
 
     # ---------------------------------------------------------------------------------------------
     # Methods used by Agent -----------------------------------------------------------------------
