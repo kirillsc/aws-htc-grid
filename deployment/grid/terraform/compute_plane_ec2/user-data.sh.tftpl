@@ -27,6 +27,41 @@ export AWS_DEFAULT_REGION="$REGION"
 TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 600")
 INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 
+# ---- bootstrap-log observability (stream this script to CloudWatch) ----
+# The worker containers ship to CloudWatch via the compose `awslogs` driver, but that only starts
+# once `docker compose up` runs below. Anything that fails BEFORE that (docker/compose install, SSM
+# config fetch, ECR login) would otherwise live only in the local /var/log/htc-bootstrap.log and be
+# lost when the failed instance is reaped. Install the CloudWatch agent first and have it tail the
+# bootstrap log into a "<instance-id>-bootstrap" stream of the existing worker log group, so a
+# pre-compose-up failure is visible in CloudWatch without SSM-ing into a dying box. The agent reads
+# the file from the beginning, so lines written before it starts are still captured. Best-effort:
+# the telemetry agent must never abort the actual worker bootstrap, hence `|| echo` (not set -e).
+setup_bootstrap_log_streaming() {
+  dnf install -y amazon-cloudwatch-agent || return 1
+  cat > /opt/aws/amazon-cloudwatch-agent/etc/bootstrap-logs.json <<CWAGENT
+{
+  "agent": { "region": "$REGION", "run_as_user": "root" },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/htc-bootstrap.log",
+            "log_group_name": "$LOG_GROUP",
+            "log_stream_name": "$INSTANCE_ID-bootstrap"
+          }
+        ]
+      }
+    }
+  }
+}
+CWAGENT
+  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/bootstrap-logs.json
+}
+setup_bootstrap_log_streaming \
+  || echo "WARNING: bootstrap-log CloudWatch streaming setup failed; continuing (container logs unaffected)"
+
 # ---- compute NUM_PAIRS (override, else floor(full capacity / per-pair budget)) ----
 if [ "$PAIRS_OVERRIDE" -gt 0 ] 2>/dev/null; then
   NUM_PAIRS="$PAIRS_OVERRIDE"
