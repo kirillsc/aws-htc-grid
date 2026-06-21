@@ -189,10 +189,10 @@ class StateTableDDB:
                 Limit=self.RETRIEVE_EXPIRED_TASKS_LIMIT,
             )
 
-            print(
-                "Partition: {} expired tasks: {}".format(
-                    state_partition, response["Items"]
-                )
+            logging.debug(
+                "Partition: %s expired tasks: %d",
+                state_partition,
+                len(response["Items"]),
             )
 
             return response["Items"]
