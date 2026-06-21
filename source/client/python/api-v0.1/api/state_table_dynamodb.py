@@ -189,11 +189,17 @@ class StateTableDDB:
                 Limit=self.RETRIEVE_EXPIRED_TASKS_LIMIT,
             )
 
-            logging.debug(
-                "Partition: %s expired tasks: %d",
-                state_partition,
-                len(response["Items"]),
-            )
+            n = len(response["Items"])
+            if n == self.RETRIEVE_EXPIRED_TASKS_LIMIT:
+                # By design we only take one page per tick (expired tasks drain across ticks),
+                # but surface when we hit the cap so a TTL-checker-can't-keep-up backlog is
+                # visible in CloudWatch instead of silently truncated.
+                logging.warning(
+                    "Partition %s hit the %d expired-task cap; remaining deferred to a later tick",
+                    state_partition,
+                    self.RETRIEVE_EXPIRED_TASKS_LIMIT,
+                )
+            logging.debug("Partition: %s expired tasks: %d", state_partition, n)
 
             return response["Items"]
 
@@ -242,18 +248,32 @@ class StateTableDDB:
     def __get_live_tasks_for_partition(self, state_partition):
         try:
             now = int(time.time())
-            response = self.state_table.query(
-                IndexName="gsi_ttl_index",
-                KeyConditionExpression=Key("task_status").eq(
-                    self.__make_task_state_from_state_and_partition(
-                        TASK_STATE_PROCESSING, state_partition
-                    )
+            key_expression = Key("task_status").eq(
+                self.__make_task_state_from_state_and_partition(
+                    TASK_STATE_PROCESSING, state_partition
                 )
-                & Key("heartbeat_expiration_timestamp").gt(now),
-                Limit=self.RETRIEVE_EXPIRED_TASKS_LIMIT,
-            )
+            ) & Key("heartbeat_expiration_timestamp").gt(now)
 
-            return response["Items"]
+            # Paginate: the busy set must be COMPLETE. A truncated page could leave a live task
+            # out, so the controller would mis-read a busy instance as idle and cordon it
+            # mid-work. (Unlike the expired path, which is allowed to drain across ticks, so no
+            # Limit here — DynamoDB's 1 MB page bound still applies and we follow it.)
+            items = []
+            query_kwargs = {
+                "IndexName": "gsi_ttl_index",
+                "KeyConditionExpression": key_expression,
+            }
+            last_evaluated_key = None
+            while True:
+                if last_evaluated_key:
+                    query_kwargs["ExclusiveStartKey"] = last_evaluated_key
+                response = self.state_table.query(**query_kwargs)
+                items += response["Items"]
+                last_evaluated_key = response.get("LastEvaluatedKey")
+                if not last_evaluated_key:
+                    break
+
+            return items
 
         except ClientError as e:
             if e.response["Error"]["Code"] in [
