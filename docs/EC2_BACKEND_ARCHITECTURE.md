@@ -43,13 +43,13 @@ churning when upgrading to the selectable layout.
                        SQS task queue(s) ApproximateNumberOfMessages (backlog)
                                   │  (read directly; scaling_metrics/pending_tasks_ddb is EKS-only)
    EventBridge rate(1 min) ─► capacity_controller Lambda (NEW, outside VPC)
-                                  │  reads backlog (SQS) + ORB live count; reconciles
+                                  │  reads backlog (SQS) + ORB live machines' vCPUs; reconciles in vCPUs
                                   │  single-flight via reserved concurrency = 1
                                   │  Lambda→Lambda Invoke
                                   ▼
                        orb_orchestrator Lambda (zip: orb-py 1.6.2 + 4 patches, python3.11, outside VPC)
-                                  │  create / status / terminate     state → 3× DynamoDB (orb-<proj>-*) + CMK
-                                  ▼  RunInstances-OnDemand (iam:PassRole worker role; injects user_data/SG/subnet/profile/AMI)
+                                  │  create(vCPU target) / status / terminate   state → 3× DynamoDB (orb-<proj>-*) + CMK
+                                  ▼  EC2 Fleet Instant, TargetCapacityUnitType=vcpu (template baked at deploy time; iam:PassRole worker role)
                        EC2 worker (AL2023, private subnet, instance profile, IMDSv2 hop=3)
                                   │  cloud-init (SSM-delivered): install Docker + compose(from S3) →
                                   │  pull agent config from SSM → ECR login →
@@ -70,9 +70,9 @@ churning when upgrading to the selectable layout.
   `AmazonEC2ContainerRegistryReadOnly` + an inline policy for SSM config read & worker-log writes.
 - Egress-only security group (Redis reachable via the control-plane Redis SG's VPC-CIDR rule).
 - A dedicated CMK + CloudWatch log group `/aws/ec2/<cluster>/worker-logs`.
-- A launch template (AL2023, IMDSv2 hop-limit 3, encrypted gp3) and the rendered cloud-init
-  `user-data.sh.tftpl`. The launch template makes the worker independently launchable; ORB launches
-  from an equivalent profile.
+- An AL2023 AMI lookup and the rendered cloud-init `user-data.sh.tftpl` (exported as
+  `worker_ami_id` / `worker_user_data_plain` for ORB). ORB builds its own EC2 Fleet launch template
+  per request from the baked ORB template - there is no standalone `aws_launch_template` resource.
 - **`user-data.sh.tftpl`** computes `NUM_PAIRS` at boot, then a bash loop renders an N-pair
   `docker-compose.yml`: each pair = `getlayer-i` (S3 lambda.zip → /var/task) → `rie-i`
   (`lambda:provided`, :8080) → `agent-i` with `network_mode`/`pid: service:rie-i`, unique
@@ -92,21 +92,28 @@ churning when upgrading to the selectable layout.
   `orb-py==1.6.2`, then applies the 4 mandatory DynamoDB-backend patches against the staged
   package before zipping. Runs on `python3.11`, outside any VPC, 512 MB / 300 s. No Dockerfile,
   no ECR repo, no image-build step.
-- Least-privilege role: DDB RW on the 3 tables, EC2 launch-template + run/terminate/describe,
-  SSM AMI read, KMS, **`iam:PassRole`** on the worker role, and SSM read of the worker user-data.
-- Grid-specific config reaches ORB two ways at cold start, so one build works for any grid:
+- Least-privilege role: DDB RW on the 3 tables, EC2 launch-template + **CreateFleet/DescribeFleets/
+  DeleteFleets/ModifyFleet** + run/terminate/describe + `DescribeInstanceTypes`, SSM AMI read, KMS,
+  and **`iam:PassRole`** on the worker role. (No SSM user-data read anymore - user_data is baked in.)
+- Grid-specific config reaches ORB two ways, so one build works for any grid:
   region + DynamoDB table prefix are read by **orb-py's own `ORB_AWS_*` env layer**
   (`AWSProviderConfig` is a pydantic-settings `BaseSettings`: `ORB_AWS_REGION`,
-  `ORB_AWS_STORAGE__DYNAMODB__{TABLE_PREFIX,REGION}`), while the launch-template values that have
-  no `ORB_AWS_*` field - subnet, SG, instance profile, AMI, instance type, **and the worker
-  user_data fetched from SSM** - are substituted into `aws_templates.json` by the handler
-  (`orb_lambda._materialize_grid_config`). `ORB_ALLOW_TERMINATE_ALL` is unset (kill switch disabled).
+  `ORB_AWS_STORAGE__DYNAMODB__{TABLE_PREFIX,REGION}`), while the template values - subnet, SG,
+  instance profile, AMI, user_data, and instance selection - are **merged into the selected
+  `aws_templates.json` template at DEPLOY TIME by Terraform** and baked into the zip (a `local_file`
+  staged into the package; `hash_extra` forces a repackage on change). The handler no longer
+  materializes anything at cold start (it only asserts the table prefix is set);
+  `ORB_ALLOW_TERMINATE_ALL` is unset (kill switch disabled). See ADR-006.
 
-**`capacity_controller/`** - the scaling brain:
+**`capacity_controller/`** - the scaling brain (scales in **vCPUs**, ADR-006):
 - EventBridge `rate(1 minute)` → Lambda (outside VPC - it only calls regional AWS APIs: Lambda, SQS, DynamoDB, EC2/SSM).
-- Reads backlog directly from SQS (`get_queue_length` → `ApproximateNumberOfMessages`) + ORB **live** machine count, computes
-  `desired = clamp(ceil(backlog / target_pending_per_instance), min, max)`, then invokes the
-  orchestrator `create` (scale-up) or `terminate` oldest-first (scale-down).
+- Reads backlog directly from SQS (`get_queue_length` → `ApproximateNumberOfMessages`) + each ORB
+  **live** machine's `vcpus` (from `status`), computes
+  `desired_vcpus = clamp(ceil(backlog / TARGET_PENDING_PER_PAIR) * PAIR_CPU, MIN_VCPUS, MAX_VCPUS)`
+  and `current_vcpus = Σ vcpus(active)`, then invokes the orchestrator `create` with the **vCPU
+  deficit** (scale-up) or cordons surplus instances for graceful drain (scale-down, ADR-005). If a
+  machine reports no `vcpus`/`memory_mib`, `_vcpus_of` logs an ERROR and falls back to 1 worker per
+  instance.
 - Single-flight via the Lambda's `reserved_concurrent_executions = 1` (ADR-001) prevents
   overlapping ticks from double-issuing (ORB `request_machines` is not idempotent). See
   `docs/architecture_design_decisions.md`.
@@ -125,13 +132,14 @@ the agent config and the control-plane Lambdas (there is no in-cluster InfluxDB)
 |---|---|---|
 | Worker host | Pod on managed node group | EC2 instance, Docker Compose |
 | Pair isolation | pod `shareProcessNamespace` | per-pair `network_mode`+`pid: service:rie-i` |
-| Scaling | KEDA + Cluster Autoscaler | capacity_controller Lambda + ORB orchestrator |
+| Scaling | KEDA + Cluster Autoscaler | capacity_controller Lambda (scales in **vCPUs**) + ORB orchestrator |
 | Demand signal | `scaling_metrics` → CloudWatch `pending_tasks_ddb` (KEDA reads it) | controller reads SQS `ApproximateNumberOfMessages` directly (`scaling_metrics` not deployed) |
+| Capacity unit | pod replicas | total fleet **vCPUs** (EC2 Fleet `TargetCapacityUnitType=vcpu`); each instance auto-packs `floor(vCPU/pair_cpu)` pairs |
 | Identity | IRSA (`htc-agent-sa`) | EC2 instance profile (same permission policy) |
 | Config | ConfigMap `agent-configmap` | SSM SecureString → `/etc/agent` |
 | Container logs | FluentBit → `/aws/eks/<cluster>/aws-fluentbit-logs` | awslogs → `/aws/ec2/<cluster>/worker-logs` |
-| Drain on scale-in | node_drainer Lambda | none in v1 (ttl_checker re-queue; Step Functions drain deferred) |
-| Capacity API | n/a | ORB `RunInstances-OnDemand` (EC2 Fleet/Spot deferred) |
+| Drain on scale-in | node_drainer Lambda | controller-owned cordon→sweep→ORB-terminate (ADR-005) |
+| Capacity API | n/a | ORB **EC2 Fleet Instant**, prebuilt template selected by `orb_template_id` (ABIS / enumerated / spot) |
 
 Shared & unchanged: VPC + endpoints, SQS, DynamoDB, Redis, S3, Cognito, API Gateway, the
 control-plane Lambdas (except `scaling_metrics`, now EKS-only), and the `grid_errors-<proj>`
@@ -159,9 +167,11 @@ terraform init -reconfigure -backend-config="bucket=$TAG-htc-grid-tfstate-..." .
 terraform apply -var-file=<repo>/generated/grid_config.json
 ```
 
-Knobs (in `ec2_worker_grid_config.json.tpl` / root variables): `ec2_instance_type`,
-`ec2_pairs_per_instance` (0=auto), `ec2_pair_cpu`, `ec2_pair_memory`, `orb_min_instances`,
-`orb_max_instances`, `orb_target_pending_per_instance`, `orb_control_interval`.
+Knobs (in `ec2_worker_grid_config.json.tpl` / root variables): `orb_template_id`
+(default `EC2Fleet-Instant-ABIS`), `ec2_worker_vcpus`, `ec2_worker_memory_mb`,
+`orb_target_pending_per_pair`, `orb_min_vcpus`, `orb_max_vcpus`, `orb_max_instances`,
+`orb_control_interval`. Instance **types** come from the selected template (ABIS range or
+enumerated list), not a single `ec2_instance_type`. See the deployment guide for the full table.
 
 > **Note:** ECR pull-through cache rules (`quay`, `registry-k8s-io`, `ecr-public`) are
 > account-global and EKS-only; a second grid in the same account should **skip** `transfer-images`
@@ -207,12 +217,20 @@ Knobs (in `ec2_worker_grid_config.json.tpl` / root variables): `ec2_instance_typ
 
 ## 6. Known limitations / deferred (v1)
 
-- **No graceful drain on scale-in.** Terminating a worker loses in-flight tasks, which `ttl_checker`
-  re-queues (requires idempotent tasks). The systemd `htc-workers` unit + async Step Functions drain
-  (the architecturev2 §B.4 blocking issue) are deferred.
-- **RunInstances on-demand only.** EC2 Fleet / Spot is a separate re-prove phase (ORB `machine_id`
-  identity and async-fulfilment assumptions change).
-- **ORB launch-template leak** - ORB creates one LT per request and doesn't delete it; add a sweeper.
+- **Graceful drain IS implemented** (ADR-005): controller-owned cordon→sweep→ORB-terminate, gated on
+  the live-task heartbeat. The `drain_deadline` backstop still force-terminates stragglers (re-queued
+  by `ttl_checker`), so idempotent tasks are still assumed. The systemd `htc-workers` unit + async
+  Step Functions drain remain deferred.
+- **EC2 Fleet Instant is the capacity API**, with capacity counted in vCPUs (ADR-006). Spot and
+  enumerated-type templates exist in the catalog but are **unproven end-to-end** - only the ABIS
+  on-demand path has been exercised on a live grid; re-prove `create→status→terminate→drain` before
+  relying on Spot.
+- **`vcpus` may be missing from ORB status.** The vCPU-unit math relies on each machine reporting
+  `vcpus`; some orb-py builds persist an empty `provider_data` (seen live on 1.6.2 for RunInstances
+  machines), which trips the controller's "1 worker per instance" fallback. Confirm the deployed
+  orb-py populates `provider_data.vcpus`, or have the controller resolve it via `DescribeInstanceTypes`.
+- **ORB launch-template leak** - ORB creates a launch template per fleet request and doesn't delete
+  it; add a sweeper.
 - **No Grafana/InfluxDB/Prometheus**; agent perf metrics off. Container logs go to CloudWatch.
 - **orb-py patches are pinned to 1.6.2**; the build fails loudly if an anchor moves - re-prove the
   create/status/terminate loop on any version bump.
@@ -254,29 +272,30 @@ htc-grid/
 │   │   │   ├── iam.tf                                    + instance role+profile (agent policy + SSM/ECR/logs)
 │   │   │   ├── sg.tf                                     + egress-only worker security group
 │   │   │   ├── logs.tf                                   + CMK + /aws/ec2/<cluster>/worker-logs log group
-│   │   │   ├── launch_template.tf                        + AL2023 LT, IMDSv2 hop=3, encrypted gp3, user-data
 │   │   │   └── user-data.sh.tftpl                        + cloud-init: NUM_PAIRS auto-compute → render N-pair compose
+│   │   │      (no launch_template.tf: ORB builds its own EC2 Fleet LT per request)
 │   │   │
 │   │   ├── orb_orchestrator/                             + NEW MODULE: ORB fleet orchestrator (zip Lambda; ported from CDK PoC)
-│   │   │   ├── main.tf                                   + 3 DynamoDB state tables + CMK + ZIP Lambda (build.sh) + IAM
-│   │   │   ├── variables.tf                              + table prefix, lambda_runtime, worker role/profile/subnet/SG/AMI inputs
+│   │   │   ├── main.tf                                   + 3 DDB tables + CMK + ZIP Lambda + IAM; renders the selected
+│   │   │   │                                               template (grid-completed) into .orb-config-staging at deploy time
+│   │   │   ├── variables.tf                              + table prefix, lambda_runtime, worker role/profile/subnet/SG/AMI, orb_template_id, pair sizing
 │   │   │   └── outputs.tf                                + function name/arn, table name, key arn
 │   │   │
-│   │   └── capacity_controller/                          + NEW MODULE: queue-driven scaling controller
+│   │   └── capacity_controller/                          + NEW MODULE: queue-driven scaling controller (vCPU unit)
 │   │       ├── main.tf                                   + EventBridge tick + Lambda (reserved concurrency=1) + IAM
-│   │       └── variables.tf                              + orchestrator fn, task queue (service/config/name) + SQS CMK, min/max/target/interval
+│   │       └── variables.tf                              + orchestrator fn, task queue + SQS CMK, pair_cpu/pair_memory, min/max_vcpus, target_per_pair, interval
 │   │
 │   └── (image_repository/terraform/*, init_grid/cloudformation/grid_state.yaml ~ pre-existing local mods, not part of this work)
 │
 ├── source/compute_plane/
 │   ├── orb_orchestrator/                                 + NEW: ORB orchestrator ZIP-build source (no Docker/ECR)
-│   │   ├── orb_lambda.py                                 + create/status/terminate dispatch + cold-start template substitution
+│   │   ├── orb_lambda.py                                 + create/status/terminate dispatch (no cold-start substitution; asserts table prefix)
 │   │   ├── build.sh                                      + stage handler+config, pip-install orb-py, apply 4 patches → .build
 │   │   ├── requirements.txt                              + orb-py==1.6.2
 │   │   ├── .gitignore                                    + ignore .build/ (zip staging dir)
 │   │   ├── patches/apply_orb_patches.py                  + the 4 mandatory orb-py DynamoDB-backend fixes (target-dir aware, idempotent)
 │   │   ├── config/config.json                            + ORB storage(dynamodb)+provider config (grid-agnostic; region/table_prefix via ORB_AWS_* env)
-│   │   ├── config/aws_templates.json                     + ORB launch templates (RunInstances-OnDemand active)
+│   │   ├── config/aws_templates.json                     + prebuilt template catalog: EC2Fleet-Instant {ABIS, OnDemand, Spot} (vcpu unit)
 │   │   └── docs/ORB_DYNAMODB_{BUG_REPORT,PATCHES}.md      + diagnosis + condensed patch table
 │   │
 │   └── python/lambda/capacity_controller/
@@ -336,5 +355,7 @@ the SAM build container; `build.sh` pip-installs `orb-py` and applies the 4 patc
 
 **How do I size the worker pair's CPU/memory?**
 One place - `agent_configuration.{agent,lambda}.{maxCPU,maxMemory}` in `grid_config.json` - feeds
-**both** backends (EKS chart limits and EC2 `cpus`/`mem_limit`). Separately, `ec2_pair_cpu`/
-`ec2_pair_memory` are the *packing budget* that decides `NUM_PAIRS` per instance.
+**both** backends (EKS chart limits and EC2 `cpus`/`mem_limit`). Separately, `ec2_worker_vcpus`/
+`ec2_worker_memory_mb` are the *packing budget* that decides `NUM_PAIRS` per instance at boot, and
+`ec2_worker_vcpus` is also the controller's pairs↔vCPUs conversion factor (ADR-006), so the boot-time
+pair count and the controller's vCPU accounting stay consistent.

@@ -23,34 +23,21 @@ variable "worker_backend" {
   }
 }
 
-variable "ec2_instance_type" {
-  description = "EC2 worker instance type (ec2 backend)."
-  type        = string
-  default     = "m6i.large"
-}
-
-variable "ec2_pairs_per_instance" {
-  description = "Fixed number of Agent+RIE pairs per worker instance. 0 = auto-compute from instance capacity (ec2 backend)."
-  type        = number
-  default     = 0
-}
-
-variable "ec2_pair_cpu" {
+# Worker instance TYPES are chosen by the selected ORB template (orb_template_id) — either an ABIS
+# range or an enumerated machine_types list — not by a single type here. These two knobs are the
+# only per-instance sizing inputs: they set the per-pair budget that each instance uses at boot to
+# auto-pack NUM_PAIRS = floor(min(vCPU/ec2_worker_vcpus, mem_mb/ec2_worker_memory_mb)). The capacity
+# controller scales the fleet in vCPUs using the same ec2_worker_vcpus, so the two stay consistent.
+variable "ec2_worker_vcpus" {
   description = "vCPU budget per worker pair, used by the boot-time NUM_PAIRS auto-compute (ec2 backend)."
   type        = number
   default     = 1
 }
 
-variable "ec2_pair_memory" {
+variable "ec2_worker_memory_mb" {
   description = "Memory budget (MB) per worker pair, used by the boot-time NUM_PAIRS auto-compute (ec2 backend)."
   type        = number
   default     = 2048
-}
-
-variable "ec2_instance_volume_size" {
-  description = "Root EBS volume size (GiB) for worker instances (ec2 backend)."
-  type        = number
-  default     = 30
 }
 
 variable "ec2_compose_plugin_version" {
@@ -59,28 +46,47 @@ variable "ec2_compose_plugin_version" {
   default     = "v2.29.7"
 }
 
-variable "orb_min_instances" {
-  description = "Minimum worker instances the capacity controller will keep (ec2 backend)."
-  type        = number
-  default     = 0
-}
-
 variable "orb_max_instances" {
-  description = "Maximum worker instances the capacity controller may launch (ec2 backend)."
+  description = "ORB per-template max_instances cap, an upper bound on the fleet's instance count (ec2 backend)."
   type        = number
   default     = 5
 }
 
-variable "orb_target_pending_per_instance" {
-  description = "Target pending tasks per worker instance (~2 * NUM_PAIRS); the controller scales to keep backlog near this. Tune by load test (ec2 backend)."
+# The capacity controller scales in vCPUs (EC2 Fleet TargetCapacityUnitType=vcpu): each pair needs
+# ec2_worker_vcpus vCPUs, and AWS packs instances until the vCPU target is met. These knobs are in
+# vCPUs / pairs, NOT instances (a heterogeneous fleet has no single "per instance" number).
+variable "orb_target_pending_per_pair" {
+  description = "Target pending tasks per worker pair; the controller sizes desired pairs = ceil(backlog / this). Tune by load test (ec2 backend)."
   type        = number
   default     = 4
+}
+
+variable "orb_min_vcpus" {
+  description = "Minimum total fleet vCPUs the capacity controller keeps (ec2 backend; floor of the vCPU target)."
+  type        = number
+  default     = 0
+}
+
+variable "orb_max_vcpus" {
+  description = "Maximum total fleet vCPUs the capacity controller may request (ec2 backend; ceiling of the vCPU target)."
+  type        = number
+  default     = 64
 }
 
 variable "orb_control_interval" {
   description = "Capacity-controller reconcile interval in seconds (ec2 backend)."
   type        = number
   default     = 60
+}
+
+# Which prebuilt ORB template to use (ec2 backend). The catalog lives in
+# source/compute_plane/orb_orchestrator/config/aws_templates.json; every template is an EC2 Fleet
+# (instant) with TargetCapacityUnitType=vcpu, differing only in instance selection (ABIS / enumerated
+# / spot). Terraform grid-completes the selected one (subnet/SG/profile/AMI/user_data) and bakes it.
+variable "orb_template_id" {
+  description = "Prebuilt ORB template id to use for worker launches (ec2 backend); see config/aws_templates.json."
+  type        = string
+  default     = "EC2Fleet-Instant-ABIS"
 }
 
 variable "ec2_drain_deadline_sec" {

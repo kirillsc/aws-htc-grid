@@ -79,7 +79,7 @@ Check whether it already exists first:
 | Component | Notes |
 |---|---|
 | VPC + control plane | Shared with EKS, unchanged |
-| `compute_plane_ec2` | Worker IAM role, SG, launch template, cloud-init (Agent+RIE pairs) |
+| `compute_plane_ec2` | Worker IAM role, SG, log group, AMI lookup, cloud-init (Agent+RIE pairs); ORB builds its own launch template per fleet request |
 | `orb_orchestrator` | Zip Lambda - launches/terminates EC2 workers (built by terraform) |
 | `capacity_controller` | Zip Lambda on a 1-min timer - scales the fleet from queue backlog |
 | SSM SecureString | Agent config pulled by workers at boot |
@@ -122,15 +122,20 @@ Defaults come from `examples/configurations/Makefile`; override by editing
 
 | Key | Default | Meaning |
 |---|---|---|
-| `ec2_instance_type` | `m6i.large` | Worker instance type |
-| `ec2_pairs_per_instance` | `0` | Agent/RIE pairs per instance (0 = auto from CPU/mem) |
-| `ec2_pair_cpu` / `ec2_pair_memory` | `1` / `2048` | Packing budget per pair (vCPU / MB) |
-| `orb_min_instances` / `orb_max_instances` | `0` / `5` | Fleet bounds |
-| `orb_target_pending_per_instance` | `4` | Backlog target per instance |
+| `orb_template_id` | `EC2Fleet-Instant-ABIS` | Which prebuilt ORB template to use (see `config/aws_templates.json`): `EC2Fleet-Instant-ABIS` (AWS picks any type in a vCPU/mem range), `EC2Fleet-Instant-OnDemand` (enumerated types), `EC2Fleet-Instant-Spot` |
+| `ec2_worker_vcpus` | `1` | vCPUs per worker pair; sizes `NUM_PAIRS` at boot and converts pairs↔vCPUs in the controller |
+| `ec2_worker_memory_mb` | `2048` | MiB per worker pair (the other half of the boot-time auto-pack) |
+| `orb_target_pending_per_pair` | `4` | Backlog target per worker pair: `desired_pairs = ceil(backlog / this)` |
+| `orb_min_vcpus` / `orb_max_vcpus` | `0` / `64` | Fleet bounds, in **total vCPUs** (floor/ceiling of the vCPU target) |
+| `orb_max_instances` | `5` | ORB per-template instance-count cap (upper safety bound) |
 | `orb_control_interval` | `60` | Controller reconcile interval (s) |
 
-Worker pair CPU/memory limits come from `agent_configuration.{agent,lambda}.{maxCPU,maxMemory}`
-in the config (one place, shared with EKS).
+The capacity controller scales the fleet in **vCPUs** (EC2 Fleet `TargetCapacityUnitType=vcpu`):
+each pair needs `ec2_worker_vcpus`, AWS packs instances until the vCPU target is met, and each
+instance auto-packs `floor(min(vCPU/ec2_worker_vcpus, mem/ec2_worker_memory_mb))` pairs at boot.
+Instance **types** come from the selected `orb_template_id` (an ABIS range or an enumerated list) -
+there is no single `ec2_instance_type`. Worker container CPU/memory *limits* still come from
+`agent_configuration.{agent,lambda}.{maxCPU,maxMemory}` in the config (one place, shared with EKS).
 
 ---
 
@@ -145,8 +150,8 @@ make delete-grid-state TAG=$TAG REGION=$AWS_REGION             # LAST: state buc
 Or use the failure-tolerant teardown script:
 `./scripts/destroy-htc-eks.sh --tag $TAG --region $AWS_REGION [--delete-state] [--force-orphans]`
 
-> ORB leaks one launch template per request (no sweeper in v1); check for orphaned
-> launch templates after teardown.
+> ORB creates a launch template per fleet request and may leak them (no sweeper in v1); check for
+> orphaned launch templates after teardown.
 
 ---
 
@@ -157,5 +162,6 @@ Or use the failure-tolerant teardown script:
 | Tasks never complete; worker up but RIE container missing | `lambda:provided` not in this region → run step 3C (`init-images` + `transfer-images`) |
 | `config-ec2` produced an EKS config | You ran `happy-path`/`upload-c++` after it → re-run `config-ec2` last |
 | Apply fails on `RepositoryAlreadyExistsException` | ECR repos are region-global; don't run `transfer-images` if they exist - build only worker images |
-| No workers ever launch | Backlog below threshold, or `orb_max_instances=0`; check capacity controller logs |
+| No workers ever launch | Backlog below threshold, or `orb_max_vcpus=0`; check capacity controller logs |
+| Controller logs `no vcpu or memory data ... defaulting to 1 worker per instance` (ERROR) | ORB status returned no `vcpus` for a machine, so vCPU-accurate sizing degraded to 1 worker/instance; confirm the deployed orb-py populates `provider_data.vcpus` |
 | Worker can't reach Redis/SQS | Worker SG is egress-only; confirm it's in the control-plane VPC/subnets |

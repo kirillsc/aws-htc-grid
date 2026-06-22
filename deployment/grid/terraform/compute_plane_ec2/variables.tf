@@ -75,18 +75,6 @@ variable "lambda_function_name" {
   default     = "function"
 }
 
-variable "instance_type" {
-  description = "Worker EC2 instance type"
-  type        = string
-  default     = "m6i.large"
-}
-
-variable "pairs_per_instance" {
-  description = "Fixed pairs per instance; 0 = auto-compute from capacity"
-  type        = number
-  default     = 0
-}
-
 variable "pair_cpu" {
   description = "vCPU budget per pair for NUM_PAIRS auto-compute"
   type        = number
@@ -124,12 +112,6 @@ variable "lambda_max_memory" {
   description = "RIE container memory limit (MiB) — from agent_configuration.lambda.maxMemory"
   type        = number
   default     = 3900
-}
-
-variable "instance_volume_size" {
-  description = "Root EBS volume size (GiB)"
-  type        = number
-  default     = 30
 }
 
 variable "compose_plugin_s3_uri" {

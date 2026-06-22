@@ -165,14 +165,16 @@ module "capacity_controller" {
     TASK_QUEUE_CONFIG          = var.task_queue_config
     TASKS_QUEUE_NAME           = var.tasks_queue_name
     # Read at import by the shared queue DAL's grid_error_logger (no agent config file in-Lambda).
-    ERROR_LOG_GROUP             = var.error_log_group
-    ERROR_LOGGING_STREAM        = var.error_logging_stream
-    MIN_INSTANCES               = tostring(var.min_instances)
-    MAX_INSTANCES               = tostring(var.max_instances)
-    TARGET_PENDING_PER_INSTANCE = tostring(var.target_pending_per_instance)
-    STATE_TABLE_NAME            = var.state_table_name
-    STATE_TABLE_SERVICE         = var.state_table_service
-    STATE_TABLE_CONFIG          = var.state_table_config
+    ERROR_LOG_GROUP         = var.error_log_group
+    ERROR_LOGGING_STREAM    = var.error_logging_stream
+    PAIR_CPU                = tostring(var.pair_cpu)
+    PAIR_MEMORY             = tostring(var.pair_memory)
+    MIN_VCPUS               = tostring(var.min_vcpus)
+    MAX_VCPUS               = tostring(var.max_vcpus)
+    TARGET_PENDING_PER_PAIR = tostring(var.target_pending_per_pair)
+    STATE_TABLE_NAME        = var.state_table_name
+    STATE_TABLE_SERVICE     = var.state_table_service
+    STATE_TABLE_CONFIG      = var.state_table_config
   }
 
   tags = {

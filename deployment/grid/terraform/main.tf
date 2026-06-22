@@ -333,11 +333,8 @@ module "compute_plane_ec2" {
   ssm_config_kms_key_arn           = module.control_plane.htc_data_bucket_key_arn
   lambda_configuration_s3_source   = try(var.agent_configuration.lambda.s3_source, local.default_agent_configuration.lambda.s3_source)
   compose_plugin_s3_uri            = "s3://${module.control_plane.htc_data_bucket_name}/ec2-worker/docker-compose"
-  instance_type                    = var.ec2_instance_type
-  pairs_per_instance               = var.ec2_pairs_per_instance
-  pair_cpu                         = var.ec2_pair_cpu
-  pair_memory                      = var.ec2_pair_memory
-  instance_volume_size             = var.ec2_instance_volume_size
+  pair_cpu                         = var.ec2_worker_vcpus
+  pair_memory                      = var.ec2_worker_memory_mb
   kms_key_admin_arns               = [data.aws_caller_identity.current.arn]
 
   # Per-container hard limits come from the SAME agent_configuration source as the EKS
@@ -354,18 +351,9 @@ module "compute_plane_ec2" {
   ]
 }
 
-# Worker cloud-init delivered to ORB via SSM (too large + multiline for a Lambda env var;
-# ORB injects it into the launch template's user_data field).
-resource "aws_ssm_parameter" "worker_user_data" {
-  count = var.worker_backend == "ec2" ? 1 : 0
-
-  name  = "/htc/${local.project_name}/worker_user_data"
-  type  = "String"
-  tier  = "Advanced"
-  value = module.compute_plane_ec2[0].worker_user_data_plain
-}
-
 # ORB orchestrator: the fleet-scaling orchestrator (create/status/terminate EC2 capacity).
+# The worker cloud-init is no longer delivered via SSM: the orchestrator module bakes it (and the
+# subnet/SG/profile/AMI + instance selection) into the rendered ORB template at deploy time.
 module "orb_orchestrator" {
   source = "./orb_orchestrator"
   count  = var.worker_backend == "ec2" ? 1 : 0
@@ -380,9 +368,11 @@ module "orb_orchestrator" {
   worker_subnet_ids           = module.vpc.private_subnet_ids
   worker_security_group_id    = module.compute_plane_ec2[0].worker_security_group_id
   worker_ami_id               = module.compute_plane_ec2[0].worker_ami_id
-  worker_instance_type        = var.ec2_instance_type
-  worker_user_data_ssm_param  = aws_ssm_parameter.worker_user_data[0].name
-  orb_template_id             = "RunInstances-OnDemand"
+  worker_user_data_plain      = module.compute_plane_ec2[0].worker_user_data_plain
+  orb_template_id             = var.orb_template_id
+  pair_cpu                    = var.ec2_worker_vcpus
+  pair_memory                 = var.ec2_worker_memory_mb
+  max_instances               = var.orb_max_instances
   kms_key_admin_arns          = [data.aws_caller_identity.current.arn]
   kms_deletion_window         = var.kms_deletion_window
 }
@@ -392,32 +382,34 @@ module "capacity_controller" {
   source = "./capacity_controller"
   count  = var.worker_backend == "ec2" ? 1 : 0
 
-  region                      = var.region
-  suffix                      = local.project_name
-  lambda_runtime              = var.lambda_runtime
-  aws_htc_ecr                 = local.aws_htc_ecr
-  orchestrator_function_name  = module.orb_orchestrator[0].function_name
-  orchestrator_function_arn   = module.orb_orchestrator[0].function_arn
-  orb_template_id             = "RunInstances-OnDemand"
-  task_queue_service          = var.task_queue_service
-  task_queue_config           = var.task_queue_config
-  tasks_queue_name            = local.tasks_queue_name
-  sqs_queue                   = local.sqs_queue
-  sqs_kms_key_arn             = module.control_plane.htc_task_queue_key_arn
-  error_log_group             = local.error_log_group
-  error_logging_stream        = local.error_logging_stream
-  min_instances               = var.orb_min_instances
-  max_instances               = var.orb_max_instances
-  target_pending_per_instance = var.orb_target_pending_per_instance
-  control_interval            = var.orb_control_interval
-  drain_deadline_sec          = var.ec2_drain_deadline_sec
-  state_table_name            = local.ddb_state_table
-  state_table_arn             = "arn:${data.aws_partition.current.partition}:dynamodb:${var.region}:${local.account_id}:table/${local.ddb_state_table}"
-  state_table_kms_key_arn     = module.control_plane.htc_dynamodb_table_key_arn
-  state_table_service         = var.state_table_service
-  state_table_config          = var.state_table_config
-  kms_key_admin_arns          = [data.aws_caller_identity.current.arn]
-  kms_deletion_window         = var.kms_deletion_window
+  region                     = var.region
+  suffix                     = local.project_name
+  lambda_runtime             = var.lambda_runtime
+  aws_htc_ecr                = local.aws_htc_ecr
+  orchestrator_function_name = module.orb_orchestrator[0].function_name
+  orchestrator_function_arn  = module.orb_orchestrator[0].function_arn
+  orb_template_id            = var.orb_template_id
+  task_queue_service         = var.task_queue_service
+  task_queue_config          = var.task_queue_config
+  tasks_queue_name           = local.tasks_queue_name
+  sqs_queue                  = local.sqs_queue
+  sqs_kms_key_arn            = module.control_plane.htc_task_queue_key_arn
+  error_log_group            = local.error_log_group
+  error_logging_stream       = local.error_logging_stream
+  pair_cpu                   = var.ec2_worker_vcpus
+  pair_memory                = var.ec2_worker_memory_mb
+  min_vcpus                  = var.orb_min_vcpus
+  max_vcpus                  = var.orb_max_vcpus
+  target_pending_per_pair    = var.orb_target_pending_per_pair
+  control_interval           = var.orb_control_interval
+  drain_deadline_sec         = var.ec2_drain_deadline_sec
+  state_table_name           = local.ddb_state_table
+  state_table_arn            = "arn:${data.aws_partition.current.partition}:dynamodb:${var.region}:${local.account_id}:table/${local.ddb_state_table}"
+  state_table_kms_key_arn    = module.control_plane.htc_dynamodb_table_key_arn
+  state_table_service        = var.state_table_service
+  state_table_config         = var.state_table_config
+  kms_key_admin_arns         = [data.aws_caller_identity.current.arn]
+  kms_deletion_window        = var.kms_deletion_window
 }
 
 

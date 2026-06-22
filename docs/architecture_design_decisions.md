@@ -4,6 +4,75 @@ Running log of notable design decisions for the EC2 worker-plane backend. Newest
 
 ---
 
+## ADR-006: Scale in vCPUs via EC2 Fleet; prebuilt template catalog selected by id
+
+**Status:** Decided - the capacity controller and ORB operate in a single **vCPU** unit, ORB launches
+an **EC2 Fleet (Instant)** with `TargetCapacityUnitType=vcpu`, and the worker template is chosen from a
+**prebuilt catalog** by `orb_template_id` and grid-completed + baked into the orchestrator zip at
+**deploy time**. Supersedes the v1 "RunInstances on-demand, scale by instance count, substitute the
+template at cold start" approach.
+
+**Context.**
+v1 scaled by *instance count* (`desired = ceil(backlog / target_pending_per_instance)`) and launched a
+single instance type via `RunInstances`. Two problems: (1) "number of instances" is not a stable
+capacity unit once a fleet is heterogeneous - a `*.large` and a `*.xlarge` are not equal capacity, so
+the math under-counts (the old `line 219` TODO); (2) instance selection was a single hardcoded type,
+and the grid-specific template values (subnet/SG/profile/AMI/user_data) were substituted into
+`aws_templates.json` by the handler at **cold start** (`_materialize_grid_config`), which also fetched
+user_data from SSM. We also wanted Attribute-Based Instance Selection (ABIS) without the controller
+having to understand it.
+
+**Decision.**
+- **vCPU is the capacity unit.** A pair needs `pair_cpu` vCPUs; an instance auto-packs
+  `floor(min(vCPU/pair_cpu, mem/pair_memory))` pairs at boot. The controller computes
+  `desired_pairs = ceil(backlog / target_pending_per_pair)`,
+  `desired_vcpus = clamp(desired_pairs * pair_cpu, min_vcpus, max_vcpus)`,
+  `current_vcpus = Σ vcpus(active)`, and asks ORB to `create` the vCPU **deficit**.
+- **EC2 Fleet Instant with `TargetCapacityUnitType=vcpu`.** ORB's `create` count is a vCPU target;
+  AWS packs a mix of instances (ABIS- or list-selected) until their vCPUs meet it, and uses each
+  instance's real vCPU as its weight. This is set via the template's `provider_api_spec` (deep-merged
+  over ORB's default fleet spec). Instant returns instance IDs synchronously and terminates explicit
+  IDs with no delete-at-zero hazard (unlike ASG, ADR-004), so the ADR-005 drain works unchanged.
+- **The controller reads `vcpus` from ORB `status`** (`provider_data.vcpus`, also surfaced top-level
+  by the default scheduler) - no `DescribeInstanceTypes` call, no extra IAM. `_vcpus_of` falls back:
+  real `vcpus` → size by `memory_mib` → if neither, log an **ERROR** and default to 1 worker per
+  instance (so the controller never crashes or counts zero, but the degradation is loud).
+- **Prebuilt template catalog, selected by id.** `config/aws_templates.json` ships a small curated
+  catalog (`EC2Fleet-Instant-{ABIS,OnDemand,Spot}`), every entry an EC2 Fleet with the vcpu unit. The
+  user picks one via `orb_template_id`; instance selection (ABIS range vs enumerated list) lives in
+  the template, **not** in grid_config. The controller is blind to which - it only sends a vCPU count.
+- **Deploy-time bake, not cold-start substitution.** Terraform merges the grid infra fields
+  (subnet/SG/profile/AMI/user_data) into the selected template and writes it to a staging dir baked
+  into the zip (`local_file` + `hash_extra` forces a repackage on change). `_materialize_grid_config`
+  is removed; the handler only asserts the table prefix. The orchestrator gains `ec2:CreateFleet`/
+  `Describe/Delete/ModifyFleet` + `DescribeInstanceTypes`; it loses the SSM user-data read.
+- **Config knobs renamed/removed:** `ec2_pair_cpu`→`ec2_worker_vcpus`,
+  `ec2_pair_memory`→`ec2_worker_memory_mb`; `orb_min_instances`/`orb_target_pending_per_instance`
+  →`orb_min_vcpus`/`orb_max_vcpus`/`orb_target_pending_per_pair`; `ec2_instance_type` and
+  `ec2_pairs_per_instance` deleted (types come from the template; pairs are always auto-packed). The
+  standalone `aws_launch_template` was removed (ORB builds its own per fleet request).
+
+**Consequences / trade-offs.**
+- Heterogeneous fleets now scale correctly: requested vCPUs ≈ delivered capacity. The `line 219` TODO
+  is closed.
+- **`vcpus` must actually be present in ORB status.** Verified live on a real grid: deployed orb-py
+  1.6.2 returned an EMPTY `provider_data` for RunInstances machines, so the controller fell back to
+  1-worker-per-instance every tick. The fleet path / a fixed orb-py build needs to populate it, else
+  the vCPU benefit is lost (the fallback keeps things running, loudly). See `orb-status-exposes-vcpus`.
+- A single Fleet uses one shared launch template, so a fixed `pairs_per_instance` override can't be
+  applied per type - pairs are always auto-packed from real capacity (this is why the override knob
+  was removed).
+
+**Revisit if:** ORB stops reporting `vcpus` reliably (then resolve it controller-side via
+`DescribeInstanceTypes`), or a non-Fleet capacity API is needed (the catalog + vcpu-unit assumptions
+are Fleet-specific).
+
+**Related:** [[ADR-005]] (controller-owned drain, preserved), [[ADR-004]] (why ASG is unusable; Instant
+fleets avoid its delete-at-zero trap), [[ADR-002]] (brain/hands split, preserved), [[ADR-001]]
+(single-flight).
+
+---
+
 ## ADR-005: Controller-owned drain core; ORB terminates (ORB owns the API choice)
 
 **Status:** Decided - the controller owns a **provider-independent drain core** (cordon,

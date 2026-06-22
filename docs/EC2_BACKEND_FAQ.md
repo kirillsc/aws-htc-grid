@@ -37,12 +37,25 @@ short and crash-safe.
 
 ## How it decides
 
-### Q4. How does the controller decide how many instances it wants?
-`desired = clamp(ceil(backlog / TARGET_PENDING_PER_INSTANCE), MIN_INSTANCES, MAX_INSTANCES)`,
-where `backlog` is read straight from the task queue - `queue_manager(...).get_queue_length()`
-(SQS `ApproximateNumberOfMessages`, summed across priority queues), see
-`ec2_capacity_controller._read_backlog`. It then reconciles in three stages: sweep draining,
-scale up the remaining deficit, cordon any surplus.
+### Q4. How does the controller decide how much capacity it wants?
+It scales in **vCPUs**, not instances (an EC2 Fleet launches a mix of instance sizes, so "number of
+instances" is not a stable unit). Each tick:
+`desired_pairs = ceil(backlog / TARGET_PENDING_PER_PAIR)`, then
+`desired_vcpus = clamp(desired_pairs * PAIR_CPU, MIN_VCPUS, MAX_VCPUS)`.
+`backlog` is read straight from the task queue - `queue_manager(...).get_queue_length()` (SQS
+`ApproximateNumberOfMessages`, summed across priority queues), see
+`ec2_capacity_controller._read_backlog`. Current capacity is `current_vcpus = Σ vcpus` over the
+active live machines (each machine's `vcpus` comes from ORB `status`; see Q4b). It then reconciles in
+three stages: sweep draining, scale up the remaining **vCPU** deficit (ORB `create` with a vCPU
+target), cordon any surplus (whole instances whose summed vCPUs cover it).
+
+### Q4b. Where does each machine's vCPU count come from, and what if it's missing?
+From ORB `status` - the AWS provider derives each machine's `vcpus` into `provider_data` and the
+default scheduler also surfaces it top-level, so the controller just sums it (no `DescribeInstanceTypes`
+call, no extra IAM). `_vcpus_of` falls back in order: real `vcpus` → size by `memory_mib` →, if
+NEITHER is present, log an **ERROR** and default to 1 worker per instance (`PAIR_CPU` vCPUs). The
+fallback keeps the controller running but loses vCPU-accurate sizing, so it is surfaced loudly. (Seen
+live: some orb-py builds persist an empty `provider_data`, which trips this fallback.)
 
 ### Q5. Which instances get drained first?
 Idle-first, then oldest - so the cheapest-to-remove instances go first
@@ -154,9 +167,11 @@ even if a stop command never lands. Two things to know from live testing:
   grid VPC's existing `ssm` + `ssmmessages` interface endpoints are sufficient.
 
 ### Q19. How do I tune scale-down behavior?
-Environment / Terraform knobs: `MIN_INSTANCES`, `MAX_INSTANCES`, `TARGET_PENDING_PER_INSTANCE`
-(`ec2_capacity_controller.py:50-52`), `DRAIN_DEADLINE_SEC` (`drain.py:43`), and the tick rate
-(`capacity_controller/main.tf:25`). See the deployment guide for the Terraform variables.
+Environment / Terraform knobs (all in vCPUs/pairs now): `MIN_VCPUS`, `MAX_VCPUS`,
+`TARGET_PENDING_PER_PAIR`, `PAIR_CPU` (`ec2_capacity_controller.py`), `DRAIN_DEADLINE_SEC`
+(`drain.py:43`), and the tick rate (`capacity_controller/main.tf`). The grid-config inputs that map
+to these are `orb_min_vcpus` / `orb_max_vcpus` / `orb_target_pending_per_pair` / `ec2_worker_vcpus` /
+`ec2_drain_deadline_sec` / `orb_control_interval`. See the deployment guide for the full table.
 
 ### Q20. Why is `terminate {"all": true}` disabled by default in ORB?
 It's a fleet-wide kill switch that **bypasses** the graceful drain path, so it's gated behind

@@ -35,7 +35,7 @@ variable "orchestrator_function_arn" {
 variable "orb_template_id" {
   description = "ORB template id used for scale-up"
   type        = string
-  default     = "RunInstances-OnDemand"
+  default     = "EC2Fleet-Instant-OnDemand"
 }
 
 variable "task_queue_service" {
@@ -73,20 +73,35 @@ variable "error_logging_stream" {
   type        = string
 }
 
-variable "min_instances" {
-  description = "Minimum worker instances"
+# The controller scales in vCPUs (EC2 Fleet TargetCapacityUnitType=vcpu). desired_pairs =
+# ceil(backlog / target_pending_per_pair); desired_vcpus = desired_pairs * pair_cpu, clamped to
+# [min_vcpus, max_vcpus]; each instance auto-packs floor(vcpus / pair_cpu) pairs at boot.
+variable "pair_cpu" {
+  description = "vCPUs per worker pair (converts pairs <-> vCPUs in the controller)"
+  type        = number
+  default     = 1
+}
+
+variable "pair_memory" {
+  description = "MiB per worker pair; only used as a fallback to size a machine by memory when ORB status has no vcpus"
+  type        = number
+  default     = 2048
+}
+
+variable "min_vcpus" {
+  description = "Minimum total fleet vCPUs (floor of the vCPU target)"
   type        = number
   default     = 0
 }
 
-variable "max_instances" {
-  description = "Maximum worker instances"
+variable "max_vcpus" {
+  description = "Maximum total fleet vCPUs (ceiling of the vCPU target)"
   type        = number
-  default     = 5
+  default     = 64
 }
 
-variable "target_pending_per_instance" {
-  description = "Target pending tasks per instance (~2 * NUM_PAIRS)"
+variable "target_pending_per_pair" {
+  description = "Target pending tasks per worker pair; desired pairs = ceil(backlog / this)"
   type        = number
   default     = 4
 }

@@ -42,13 +42,22 @@ def _invoke(payload: dict) -> dict:
 
 
 def list_live() -> list[dict]:
-    """Live (non-terminated) machines ORB manages, each a dict with at least 'machine_id'."""
+    """Live (non-terminated) machines ORB manages.
+
+    Each machine dict carries at least 'machine_id', 'instance_type', and 'vcpus' (the default
+    scheduler surfaces vcpus at the top level and inside 'provider_data'); the controller sums
+    'vcpus' to measure capacity.
+    """
     body = _invoke({"action": "status"})
     return body.get("body", {}).get("result", {}).get("machines", [])
 
 
 def create(count: int) -> dict:
-    """Ask ORB to add `count` units of capacity (ORB picks the AWS API per its config)."""
+    """Ask ORB to add `count` units of capacity.
+
+    For the EC2 Fleet template (TargetCapacityUnitType=vcpu) `count` is a vCPU target:
+    ORB sets TotalTargetCapacity=count and AWS packs instances until their summed vCPUs meet it.
+    """
     res = _invoke({"action": "create", "template_id": TEMPLATE_ID, "count": count})
     logger.info("orb.create", count=count, template_id=TEMPLATE_ID)
     return res

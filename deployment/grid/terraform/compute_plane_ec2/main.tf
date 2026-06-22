@@ -3,9 +3,9 @@
 # Licensed under the Apache License, Version 2.0 https://aws.amazon.com/apache-2-0/
 
 # Worker-plane definition for the ec2 backend: the IAM instance profile, security group,
-# container-log group, and the launch template (rendered user-data that boots N Agent+RIE
-# Compose pairs). ORB launches instances from an equivalent template; this launch template
-# also makes the worker independently launchable for testing.
+# container-log group, and the rendered worker user-data (boots N Agent+RIE Compose pairs).
+# ORB launches instances directly (it builds its own launch template per fleet request from the
+# baked ORB template); this module just produces the role/profile/SG/AMI/user-data ORB consumes.
 
 locals {
   suffix     = var.suffix
@@ -26,7 +26,6 @@ locals {
     s3_source            = var.lambda_configuration_s3_source
     ssm_config_param     = var.ssm_config_parameter_name
     compose_s3           = var.compose_plugin_s3_uri
-    pairs_per_instance   = var.pairs_per_instance
     pair_cpu             = var.pair_cpu
     pair_memory          = var.pair_memory
     agent_cpus           = var.agent_max_cpu / 1000   # millicores → cores for compose `cpus`
@@ -35,9 +34,6 @@ locals {
     rie_memory           = "${var.lambda_max_memory}m"
     log_group            = local.worker_log_group_name
   })
-
-  # Launch template wants base64; ORB wants plain text (it base64-encodes itself).
-  user_data = base64encode(local.user_data_plain)
 }
 
 data "aws_caller_identity" "current" {}

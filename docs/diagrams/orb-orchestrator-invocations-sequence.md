@@ -104,8 +104,10 @@ sequenceDiagram
   success → `200 {body}`, `BadRequest` → `400 {error}` (warned, no stacktrace), any other
   exception → `500 {error}` (logged with stacktrace).
 - **`create`.** `request_machines(template_id, count)` - `count` defaults to 1, `template_id`
-  defaults to `RunInstances-OnDemand`. ORB records the request and launches instances; the call
-  returns before instances exist (eventually consistent - the next `status` sees them).
+  defaults to `EC2Fleet-Instant-ABIS`. For the EC2 Fleet templates (`TargetCapacityUnitType=vcpu`)
+  `count` is a **vCPU target**, not an instance count: ORB sets `TotalTargetCapacity=count` and AWS
+  packs a mix of instances until their vCPUs meet it. ORB records the request and launches instances;
+  the call returns before instances exist (eventually consistent - the next `status` sees them).
 - **`status` has two shapes.** With a `request_id`, it calls `get_request_status([id])` directly
   and returns - no reconcile, no machine list. Without one (the controller's path), it first runs
   `_reconcile_requests` then `list_machines`, filtering to live machines via `_live_machines`

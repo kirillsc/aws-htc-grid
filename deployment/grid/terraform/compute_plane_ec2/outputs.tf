@@ -27,19 +27,9 @@ output "worker_log_group_name" {
   value       = aws_cloudwatch_log_group.worker_logs.name
 }
 
-output "launch_template_id" {
-  description = "Worker launch template id"
-  value       = aws_launch_template.worker.id
-}
-
 output "worker_ami_id" {
   description = "Resolved AL2023 AMI id used by the worker"
   value       = data.aws_ssm_parameter.al2023_ami.value
-}
-
-output "worker_user_data_base64" {
-  description = "Base64 cloud-init the worker boots with (for ORB template parity)"
-  value       = local.user_data
 }
 
 output "worker_user_data_plain" {

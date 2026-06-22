@@ -17,7 +17,6 @@ S3_SOURCE="${s3_source}"
 SSM_CONFIG_PARAM="${ssm_config_param}"
 COMPOSE_S3="${compose_s3}"
 LOG_GROUP="${log_group}"
-PAIRS_OVERRIDE="${pairs_per_instance}"
 PAIR_CPU="${pair_cpu}"
 PAIR_MEMORY="${pair_memory}"
 
@@ -62,19 +61,19 @@ CWAGENT
 setup_bootstrap_log_streaming \
   || echo "WARNING: bootstrap-log CloudWatch streaming setup failed; continuing (container logs unaffected)"
 
-# ---- compute NUM_PAIRS (override, else floor(full capacity / per-pair budget)) ----
-if [ "$PAIRS_OVERRIDE" -gt 0 ] 2>/dev/null; then
-  NUM_PAIRS="$PAIRS_OVERRIDE"
-else
-  VCPU=$(nproc)
-  MEM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
-  BY_CPU=$(( VCPU / PAIR_CPU ))
-  BY_MEM=$(( MEM_MB / PAIR_MEMORY ))
-  NUM_PAIRS=$BY_CPU
-  [ "$BY_MEM" -lt "$NUM_PAIRS" ] && NUM_PAIRS=$BY_MEM
-  [ "$NUM_PAIRS" -lt 1 ] && NUM_PAIRS=1
-fi
-echo "NUM_PAIRS=$NUM_PAIRS (override=$PAIRS_OVERRIDE cpu/pair=$PAIR_CPU mem/pair=$PAIR_MEMORY)"
+# ---- compute NUM_PAIRS: floor(full instance capacity / per-pair budget) ----
+# Always auto-packed from this instance's real vCPU/memory. The capacity controller scales the
+# fleet in vCPUs and accounts each instance as floor(vCPU / PAIR_CPU) pairs, so the boot-time pair
+# count MUST match that formula — there is deliberately no fixed-override knob (it would desync the
+# controller's vCPU accounting on a heterogeneous fleet).
+VCPU=$(nproc)
+MEM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
+BY_CPU=$(( VCPU / PAIR_CPU ))
+BY_MEM=$(( MEM_MB / PAIR_MEMORY ))
+NUM_PAIRS=$BY_CPU
+[ "$BY_MEM" -lt "$NUM_PAIRS" ] && NUM_PAIRS=$BY_MEM
+[ "$NUM_PAIRS" -lt 1 ] && NUM_PAIRS=1
+echo "NUM_PAIRS=$NUM_PAIRS (cpu/pair=$PAIR_CPU mem/pair=$PAIR_MEMORY vcpu=$VCPU mem_mb=$MEM_MB)"
 
 # ---- Docker + compose plugin (plugin from S3; github is unreachable on private subnets) ----
 dnf install -y docker

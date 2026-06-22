@@ -171,101 +171,36 @@ for _var in (
         os.makedirs(_path, exist_ok=True)
 
 
-def _materialize_grid_config() -> None:
-    """Render the bundled ORB config with this grid's values and point ORB at it.
+def _assert_grid_config() -> None:
+    """Assert the grid's DynamoDB table prefix is set; the templates are baked at deploy time.
 
-    The image bundles a read-only config (/var/task/orb-config). Grid-specific values reach
-    ORB by two routes:
+    The orb_orchestrator Terraform module now RENDERS a grid-complete aws_templates.json at apply
+    time (subnet / SG / instance-profile / AMI / user_data + the EC2Fleet vCPU-unit native spec all
+    filled in) and bakes it into the zip under /var/task/orb-config. So there is nothing to
+    materialize at cold start — ORB reads the bundled, read-only config directly (ORB_CONFIG_DIR
+    stays /var/task/orb-config; ORB only ever reads the templates on the create/status/terminate
+    path, never writes them).
 
-      * Core provider config (region + DynamoDB table prefix) is driven by ORB's OWN env-var
-        layer: orb-py's AWSProviderConfig is a pydantic-settings BaseSettings with
-        env_prefix="ORB_AWS_" and env_nested_delimiter="__", so ORB reads ORB_AWS_REGION and
-        ORB_AWS_STORAGE__DYNAMODB__{TABLE_PREFIX,REGION} directly. The bundled config.json
-        therefore leaves region/table_prefix UNSET (empty dynamodb {}); a value present in the
-        file would be passed as an init kwarg and, by pydantic-settings precedence, win over the
-        env var — defeating the point. We must NOT write those keys here.
-      * Launch-template values (subnet / SG / instance-profile / AMI / instance-type / user_data)
-        have no field on AWSProviderConfig and so no ORB_AWS_* env path. They still need manual
-        substitution into aws_templates.json, which is what the rest of this function does.
+    Region + DynamoDB table prefix are still driven by ORB's OWN env-var layer: orb-py's
+    AWSProviderConfig is a pydantic-settings BaseSettings (env_prefix="ORB_AWS_",
+    env_nested_delimiter="__"), so it reads ORB_AWS_REGION and ORB_AWS_STORAGE__DYNAMODB__* directly
+    and the bundled config.json deliberately leaves those unset.
 
-    We copy the config to a writable /tmp dir, substitute the template values, and repoint
-    ORB_CONFIG_DIR. This keeps ONE image usable for any grid (no per-grid image build).
+    We only fail loud if the table prefix is missing: orb-py's DynamodbStrategyConfig defaults
+    table_prefix to "hostfactory", so an unset env var would SILENTLY point ORB at the wrong (or
+    non-existent) tables. In the Terraform deployment the module always sets it.
     """
-    src = os.environ.get("ORB_CONFIG_DIR")
-    if not src:
-        return  # no bundled config dir (e.g. local/PoC use of the baked config)
+    if not os.environ.get("ORB_CONFIG_DIR"):
+        return  # no bundled config dir (e.g. local test use of the baked config)
 
-    # Fail loud if the grid's table prefix is missing. orb-py's DynamodbStrategyConfig defaults
-    # table_prefix to "hostfactory", so an unset env var would SILENTLY point ORB at the wrong
-    # (or non-existent) DynamoDB tables. ORB reads this var itself; we only assert its presence.
-    # In the Terraform deployment the orb_orchestrator module always sets it.
-    table_prefix = os.environ.get("ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX")
-    if not table_prefix:
+    if not os.environ.get("ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX"):
         raise RuntimeError(
             "ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX is unset; refusing to fall back to orb-py's "
             "'hostfactory' default table prefix. Set it (the orb_orchestrator Terraform module does)."
         )
 
-    import json
 
-    dst = "/tmp/orb-config"
-    shutil.rmtree(dst, ignore_errors=True)
-    shutil.copytree(src, dst)
-
-    # Region for our own boto3 SSM client below. ORB resolves its region from ORB_AWS_REGION;
-    # read the same var so the SSM fetch and ORB agree.
-    region = os.environ.get("ORB_AWS_REGION", "eu-west-1")
-    subnet_ids = [s for s in os.environ.get("ORB_AWS_SUBNET_IDS", "").split(",") if s]
-    sg_ids = [s for s in os.environ.get("ORB_AWS_SECURITY_GROUP_IDS", "").split(",") if s]
-    instance_profile = os.environ.get("ORB_AWS_INSTANCE_PROFILE_ARN", "")
-    image_id = os.environ.get("ORB_AWS_IMAGE_ID", "")
-    instance_type = os.environ.get("ORB_AWS_INSTANCE_TYPE", "")
-    template_id = os.environ.get("ORB_AWS_TEMPLATE_ID", "RunInstances-OnDemand")
-
-    # The worker cloud-init is large and lives in SSM; fetch it (plain text — ORB
-    # base64-encodes user_data itself when building the launch template).
-    user_data = ""
-    ud_param = os.environ.get("ORB_AWS_USER_DATA_SSM_PARAM")
-    if ud_param:
-        import boto3
-
-        try:
-            user_data = (
-                boto3.client("ssm", region_name=region)
-                .get_parameter(Name=ud_param)["Parameter"]["Value"]
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("could not load worker user_data from SSM", ssm_param=ud_param)
-
-    # config.json is shipped grid-agnostic: region + table_prefix come from ORB_AWS_* env vars
-    # (see docstring), so there is nothing to substitute there. Only aws_templates.json needs
-    # grid values, since its template fields have no ORB_AWS_* env path.
-    # aws_templates.json: fill the active RunInstances template with grid values.
-    tpl_path = os.path.join(dst, "aws_templates.json")
-    with open(tpl_path) as f:
-        tpls = json.load(f)
-    for t in tpls.get("templates", []):
-        if t.get("template_id") != template_id:
-            continue
-        if subnet_ids:
-            t["subnet_ids"] = subnet_ids
-        if sg_ids:
-            t["security_group_ids"] = sg_ids
-        if instance_profile:
-            t["instance_profile"] = instance_profile
-        if image_id:
-            t["image_id"] = image_id
-        if instance_type:
-            t["machine_types"] = {instance_type: 1}
-        if user_data:
-            t["user_data"] = user_data
-    with open(tpl_path, "w") as f:
-        json.dump(tpls, f, indent=2)
-
-    os.environ["ORB_CONFIG_DIR"] = dst
-
-
-_materialize_grid_config()
+_assert_grid_config()
 
 
 class BadRequest(Exception):

@@ -53,20 +53,32 @@ variable "worker_ami_id" {
   type        = string
 }
 
-variable "worker_instance_type" {
-  description = "Worker instance type"
-  type        = string
-}
-
 variable "orb_template_id" {
-  description = "ORB template id used for worker launches"
+  description = "Which prebuilt template (from config/aws_templates.json) to grid-complete and use for worker launches"
   type        = string
-  default     = "RunInstances-OnDemand"
+  default     = "EC2Fleet-Instant-ABIS"
 }
 
-variable "worker_user_data_ssm_param" {
-  description = "SSM parameter name holding the plain-text worker cloud-init (injected into the ORB template user_data)"
+variable "worker_user_data_plain" {
+  description = "Plain-text worker cloud-init, baked into the rendered ORB template's user_data at deploy time (ORB base64-encodes it itself)"
   type        = string
+  sensitive   = true
+}
+
+variable "pair_cpu" {
+  description = "vCPUs per worker pair; the fleet target capacity is sized in vCPUs and each instance auto-packs floor(vCPU/pair_cpu) pairs"
+  type        = number
+}
+
+variable "pair_memory" {
+  description = "MiB per worker pair (paired with pair_cpu for the boot-time auto-pack; used for the ABIS min-memory floor guard)"
+  type        = number
+}
+
+variable "max_instances" {
+  description = "ORB per-template max_instances cap (upper bound on the fleet); overrides the selected template's value"
+  type        = number
+  default     = 10
 }
 
 variable "kms_key_admin_arns" {

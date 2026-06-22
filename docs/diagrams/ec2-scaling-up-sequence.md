@@ -34,11 +34,11 @@ sequenceDiagram
     SQSQ-->>CTL: ApproximateNumberOfMessages
     CTL->>ORB: status (how many live?)
     ORB-->>CTL: live machines
-    Note over CTL: desired = clamp(ceil(backlog / target_per_instance), min, max)<br/>deficit = desired - active
+    Note over CTL: desired_vcpus = clamp(ceil(backlog / target_per_pair) * pair_cpu, min, max)<br/>current_vcpus = Σ vcpus(active); deficit = desired_vcpus - current_vcpus
     alt deficit > 0
-        Note over CTL: first reclaim any draining instances (uncordon),<br/>then create the remainder
-        CTL->>ORB: create (remaining deficit)
-        ORB->>EC2: launch worker(s)
+        Note over CTL: first reclaim any draining instances (uncordon),<br/>then create the remaining vCPU deficit
+        CTL->>ORB: create (vCPU target = remaining deficit)
+        ORB->>EC2: launch worker(s) (EC2 Fleet packs to the vCPU target)
     else deficit <= 0
         Note over CTL: no scale-up<br/>(surplus is handled by scale-down - see down doc)
     end
@@ -75,19 +75,19 @@ sequenceDiagram
     ORB->>DDB: list machines (filter live)
     DDB-->>ORB: live machines
     ORB-->>CTL: machines (with machine_id)
-    Note over CTL: read EC2 drain tags → split live into active vs draining<br/>desired = clamp(ceil(backlog / target_per_instance), min, max)<br/>deficit = desired - active
+    Note over CTL: read EC2 drain tags → split live into active vs draining<br/>desired_vcpus = clamp(ceil(backlog / target_per_pair) * pair_cpu, min, max)<br/>current_vcpus = Σ vcpus(active); deficit = desired_vcpus - current_vcpus
 
     alt deficit > 0  (scale up)
         Note over CTL: Stage 1 - sweep: reclaim draining instances first
         opt some instances are draining
             CTL->>EC2: uncordon (clear drain tags + SSM `compose start`)
-            Note over CTL,EC2: each reclaimed instance consumes one unit of the deficit
+            Note over CTL,EC2: each reclaimed instance consumes its vCPUs from the deficit
         end
-        Note over CTL: Stage 2 - create the deficit that remains after reclaim
+        Note over CTL: Stage 2 - create the vCPU deficit that remains after reclaim
         opt deficit still > 0
-            CTL->>ORB: invoke {"action":"create","template_id":"RunInstances-OnDemand","count":Δ}
+            CTL->>ORB: invoke {"action":"create","template_id":"EC2Fleet-Instant-ABIS","count":Δvcpus}
             ORB->>DDB: record request
-            ORB->>EC2: RunInstances (worker template)
+            ORB->>EC2: CreateFleet (TargetCapacityUnitType=vcpu; ABIS or enumerated types)
             Note over EC2: cloud-init: SSM config → ECR login →<br/>NUM_PAIRS = min(vCPU/pair_cpu, mem/pair_mem) →<br/>docker compose up -d (N agent+RIE pairs)
             EC2->>SQS: long-poll, claim, run, write results
         end
@@ -107,13 +107,15 @@ sequenceDiagram
   one tick instead of stacking two ~1-min schedules plus CloudWatch ingestion lag.
   `scaling_metrics` / `pending_tasks_ddb` remain **EKS-only** (KEDA consumes the metric
   there); they are not deployed on the ec2 backend.
-- **Demand vs supply.** The SQS backlog is the demand signal; ORB's live machine count is
-  supply. The controller reconciles to
-  `desired = clamp(ceil(backlog / target_pending_per_instance), min, max)` and computes
-  `deficit = desired - active`, where `active` is live machines that are **not** draining.
+- **Demand vs supply, in vCPUs.** The SQS backlog is the demand signal; the live fleet's total
+  vCPUs is supply. The controller reconciles to
+  `desired_vcpus = clamp(ceil(backlog / target_pending_per_pair) * pair_cpu, min, max)` and computes
+  `deficit = desired_vcpus - current_vcpus`, where `current_vcpus = Σ vcpus` over the **active**
+  (non-draining) machines (each machine's `vcpus` from ORB `status`). Counting in vCPUs makes a
+  heterogeneous fleet correct: a bigger instance counts proportionally more.
 - **Reclaim before launch.** Scale-up has two stages. The sweep stage first **uncordons**
   draining instances (clear the `htc:lifecycle`/`htc:drain_deadline` tags + SSM
-  `docker compose start`) up to the size of the deficit, reclaiming capacity that was on its
+  `docker compose start`) up to the size of the vCPU deficit, reclaiming capacity that was on its
   way out instead of launching new instances; only the deficit that remains is sent to ORB
   `create`. So a backlog rebound during a drain is absorbed by reclaim, not by new launches.
 - **Single-flight via `reserved_concurrent_executions = 1`** (ADR-001). At most one tick runs
@@ -123,14 +125,17 @@ sequenceDiagram
   `docs/architecture_design_decisions.md`.
 - **Eventually consistent.** `create` returns before instances exist; the next tick sees them
   via `status`, so the loop self-corrects rather than over-launching.
-- **Two scaling levels.** ORB scales the number of instances; each instance computes its own
-  pair count (`NUM_PAIRS`) at boot. Per-instance worker count is static. (Note: `desired`
-  currently assumes one worker per instance - `desired = ceil(backlog / target_per_instance)`
-  - which under-counts capacity when `NUM_PAIRS > 1`; see the `TODO` at
-  `ec2_capacity_controller.py:219`.)
+- **Two scaling levels, one unit.** The controller asks ORB for a vCPU target; AWS packs instances
+  (ABIS or enumerated) until their vCPUs sum to it; each instance then auto-packs
+  `floor(min(vCPU/pair_cpu, mem/pair_mem))` pairs at boot. Because the controller counts in the same
+  vCPU unit the instance packs by, requested ≈ delivered capacity even for a mixed-size fleet
+  (this replaced the old one-worker-per-instance assumption). See ADR-006.
 - **The controller owns drain, not ORB (ADR-005).** The cordon/uncordon/sweep actions are
   EC2-level and issued by the controller directly (`drain.py`: boto3 `CreateTags`/`DeleteTags`
   + SSM `compose stop`/`start`). ORB is invoked only for capacity bookkeeping -
   `status` / `create` / `terminate` (`orb_client.py`). ORB owns the AWS API choice
-  (RunInstances / EC2Fleet / ASG).
-- **Deferred (v1).** On-demand RunInstances only (EC2 Fleet/Spot is a later phase).
+  (it builds an EC2 Fleet per request from the selected template).
+- **Template selection.** `create` names a prebuilt template (default `EC2Fleet-Instant-ABIS`); the
+  catalog (`config/aws_templates.json`) is grid-completed + baked at deploy time. The controller
+  treats every template identically (it only sends a vCPU count), so ABIS vs enumerated is invisible
+  to it. See ADR-006.

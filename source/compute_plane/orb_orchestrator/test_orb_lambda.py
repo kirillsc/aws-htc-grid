@@ -311,88 +311,34 @@ class StatusReconcileTests(unittest.TestCase):
         )
 
 
-class MaterializeGridConfigTests(unittest.TestCase):
-    """_materialize_grid_config: env-driven core config + template-only substitution.
-
-    Core provider config (region / DynamoDB table prefix) is consumed by orb-py's own
-    ORB_AWS_* env-var layer, so config.json must be left grid-agnostic (NOT rewritten here).
-    The launch template, which has no ORB_AWS_* env path, is still substituted in place.
+class AssertGridConfigTests(unittest.TestCase):
+    """_assert_grid_config: templates are baked at deploy time, so cold start only asserts the
+    DynamoDB table prefix is set (orb-py would otherwise silently use its 'hostfactory' default).
     """
 
-    import json as _json
-    import tempfile
-
-    def _make_src(self):
-        """A minimal bundled config dir: grid-agnostic config.json + one template."""
-        src = self.tempfile.mkdtemp(prefix="orb-src-")
-        cfg = {
-            "storage": {"strategy": "dynamodb"},
-            "provider": {
-                "providers": [
-                    {"name": "aws", "type": "aws", "config": {"storage": {"dynamodb": {}}}}
-                ]
-            },
-        }
-        tpls = {
-            "templates": [
-                {
-                    "template_id": "RunInstances-OnDemand",
-                    "subnet_ids": ["subnet-placeholder"],
-                    "machine_types": {"t3.micro": 1},
-                }
-            ]
-        }
-        with open(os.path.join(src, "config.json"), "w") as f:
-            self._json.dump(cfg, f)
-        with open(os.path.join(src, "aws_templates.json"), "w") as f:
-            self._json.dump(tpls, f)
-        return src
-
-    def _base_env(self, src):
-        return {
-            "ORB_CONFIG_DIR": src,
-            "ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX": "orb-test",
-            "ORB_AWS_REGION": "us-east-1",
-            "ORB_AWS_SUBNET_IDS": "subnet-a,subnet-b",
-            "ORB_AWS_SECURITY_GROUP_IDS": "sg-1",
-            "ORB_AWS_INSTANCE_PROFILE_ARN": "arn:aws:iam::123:instance-profile/p",
-            "ORB_AWS_IMAGE_ID": "ami-123",
-            "ORB_AWS_INSTANCE_TYPE": "t3.large",
-        }
-
     def test_missing_table_prefix_raises(self):
-        src = self._make_src()
-        env = self._base_env(src)
-        env.pop("ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX")
+        # ORB_CONFIG_DIR set but no table prefix -> fail loud.
+        env = {"ORB_CONFIG_DIR": "/var/task/orb-config"}
         with mock.patch.dict(os.environ, env, clear=False):
             os.environ.pop("ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX", None)
             with self.assertRaises(RuntimeError):
-                orb_lambda._materialize_grid_config()
+                orb_lambda._assert_grid_config()
 
-    def test_config_json_left_grid_agnostic(self):
-        # config.json must NOT be rewritten: region/table_prefix come from ORB_AWS_* env vars,
-        # and writing them into the file would (by pydantic-settings precedence) beat the env var.
-        src = self._make_src()
-        with mock.patch.dict(os.environ, self._base_env(src), clear=False):
-            orb_lambda._materialize_grid_config()
-            with open("/tmp/orb-config/config.json") as f:
-                cfg = self._json.load(f)
-        dynamodb = cfg["provider"]["providers"][0]["config"]["storage"]["dynamodb"]
-        self.assertEqual(dynamodb, {})  # still empty -> env layer supplies the values
-        self.assertNotIn("dynamodb_strategy", cfg["storage"])  # deprecated key not introduced
+    def test_table_prefix_present_passes(self):
+        env = {
+            "ORB_CONFIG_DIR": "/var/task/orb-config",
+            "ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX": "orb-test",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            orb_lambda._assert_grid_config()  # no raise
 
-    def test_template_substituted_in_place(self):
-        src = self._make_src()
-        with mock.patch.dict(os.environ, self._base_env(src), clear=False):
-            orb_lambda._materialize_grid_config()
-            with open("/tmp/orb-config/aws_templates.json") as f:
-                tpls = self._json.load(f)
-        t = tpls["templates"][0]
-        self.assertEqual(t["subnet_ids"], ["subnet-a", "subnet-b"])
-        self.assertEqual(t["security_group_ids"], ["sg-1"])
-        self.assertEqual(t["instance_profile"], "arn:aws:iam::123:instance-profile/p")
-        self.assertEqual(t["image_id"], "ami-123")
-        self.assertEqual(t["machine_types"], {"t3.large": 1})  # overrode bundled t3.micro
+    def test_no_config_dir_is_noop(self):
+        # Local/test use without a bundled config dir: skip the assertion entirely.
+        env = dict(os.environ)
+        env.pop("ORB_CONFIG_DIR", None)
+        env.pop("ORB_AWS_STORAGE__DYNAMODB__TABLE_PREFIX", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            orb_lambda._assert_grid_config()  # no raise
 
 
 class ShippedConfigJsonTests(unittest.TestCase):
