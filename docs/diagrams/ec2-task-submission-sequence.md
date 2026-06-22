@@ -1,11 +1,11 @@
-# HTC-Grid EC2 Backend — Sample Task Submission Sequence
+# HTC-Grid EC2 Backend - Sample Task Submission Sequence
 
 The path a sample workload takes on the `worker_backend = "ec2"` grid: a host outside
 the VPC orchestrates `ec2_submit_one.sh`, which runs the submitter image **on an
 in-VPC worker** (via SSM) so it can reach the private API Gateway and Redis. The
 client submits N sessions of tasks, the worker pairs execute them, and the client
 polls for results and verifies each one. This is the dataplane companion to the
-scaling loop in `ec2-scaling-sequence.md`.
+scaling loop in `ec2-scaling-up-sequence.md`.
 
 ## High-level (the core flow)
 
@@ -65,7 +65,7 @@ sequenceDiagram
         participant PAIR as agent + RIE pairs
     end
 
-    Note over SH: this script does NOT create capacity —<br/>it requires a worker to be running already
+    Note over SH: this script does NOT create capacity -<br/>it requires a worker to be running already
 
     SH->>ORB: invoke {"action":"status"}
     ORB-->>SH: machines[] → first status=="running"
@@ -96,12 +96,12 @@ sequenceDiagram
     end
     SUB->>STORE: get_output(task) for each finished task
     STORE-->>SUB: stdout bytes (b64)
-    Note over SUB: verify_results(stdout) per task —<br/>sys.exit(1) on any mismatch → container exits non-zero
+    Note over SUB: verify_results(stdout) per task -<br/>sys.exit(1) on any mismatch → container exits non-zero
     SUB-->>WK: prints results (stdout) + "All results are verified!"
 
     SH->>SSM: GetCommandInvocation
     SSM-->>SH: Status, ResponseCode, stdout, stderr
-    Note over SH: PASS iff Status=Success && exit_code=0<br/>(verify log line is a bonus — SSM truncates streams ~24KB)
+    Note over SH: PASS iff Status=Success && exit_code=0<br/>(verify log line is a bonus - SSM truncates streams ~24KB)
 ```
 
 ## Notes
@@ -112,7 +112,7 @@ sequenceDiagram
   and only orchestrates from outside. Required operator creds: `lambda:InvokeFunction`
   (status only), `ssm:SendCommand` + `GetCommandInvocation`, `ec2:DescribeInstances`.
 - **`INTRA_VPC=1` changes two things** (`connector.py`). It points the client at the
-  **private** API Gateway and **skips Cognito** authentication — so the only "login"
+  **private** API Gateway and **skips Cognito** authentication - so the only "login"
   needed is the ECR `docker login` the script runs on the worker before `docker run`
   (the submitter image is private). The worker's instance profile already grants ECR
   pull, matching what the bootstrap user-data does at boot.
@@ -133,11 +133,11 @@ sequenceDiagram
   gates nothing. See `ec2-worker-bootstrap-sequence.md`.
 - **Verification is exit-code authoritative.** `client.py` calls `sys.exit(1)` if
   `verify_results()` fails for any task, and `multiprocessing_execute_py` re-raises a
-  non-zero child exit, so the container — and thus the SSM command — can only exit `0`
+  non-zero child exit, so the container - and thus the SSM command - can only exit `0`
   if **every** task's result was retrieved and verified. The operator host therefore
   decides PASS/FAIL on `Status=Success && ResponseCode=0`; the
   `All results are verified!` log line is surfaced when present but not required
   (SSM truncates each output stream to ~24 KB, so the tail can be cut off).
 - **No capacity management here.** This path assumes a worker is already running and
   errors out if none is; capacity is driven separately by the scaling loop
-  (`ec2-scaling-sequence.md`) or manually (e.g. `orb_api_probe.sh RUN_CREATE=1`).
+  (`ec2-scaling-up-sequence.md`) or manually (e.g. `orb_api_probe.sh RUN_CREATE=1`).

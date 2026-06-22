@@ -1,10 +1,10 @@
-# HTC-Grid EC2 Backend — ORB Orchestrator Invocations
+# HTC-Grid EC2 Backend - ORB Orchestrator Invocations
 
 The `orb-orchestrator-${TAG}` Lambda is the single entry point the capacity controller (and the
-example scripts) use to drive EC2 capacity through ORB. Every invocation carries an `action` —
-one of `create`, `status`, or `terminate` — and the handler dispatches on it. The high-level
+example scripts) use to drive EC2 capacity through ORB. Every invocation carries an `action` -
+one of `create`, `status`, or `terminate` - and the handler dispatches on it. The high-level
 diagram shows all three actions; the detailed diagram zooms into the `status` path. It is the
-actuator companion to the scaling-decision loop in `ec2-scaling-sequence.md`.
+actuator companion to the scaling-decision loop in `ec2-scaling-up-sequence.md`.
 
 ## High-level (the three actions)
 
@@ -46,7 +46,7 @@ sequenceDiagram
     end
 ```
 
-## Detailed — the `status` path
+## Detailed - the `status` path
 
 The two shapes of a `status` invocation: request-scoped (a `request_id` is passed → direct
 `get_request_status`, no reconcile or machine list) and fleet-wide (the capacity controller's
@@ -77,7 +77,7 @@ sequenceDiagram
         ORB->>DDB: reconcile + persist
         H-->>CTL: 200 {action:status, result}
 
-    else fleet-wide (no request_id — the controller path)
+    else fleet-wide (no request_id - the controller path)
         Note over H: _reconcile_requests: list_requests, then sync each NON-terminal one
         H->>ORB: list_requests()
         ORB->>DDB: read requests
@@ -86,7 +86,7 @@ sequenceDiagram
             ORB->>EC2: fetch live machines
             ORB->>DDB: reconcile + persist (pending→running, etc.)
         end
-        Note over H: terminal (complete/failed/cancelled) skipped —<br/>can't advance, avoids slow sync + transition ERROR
+        Note over H: terminal (complete/failed/cancelled) skipped -<br/>can't advance, avoids slow sync + transition ERROR
         H->>ORB: list_machines()
         ORB->>DDB: read machines (cache)
         Note over H: _live_machines filter unless include_terminated=true<br/>LIVE_STATES = pending/running/stopping/shutting-down
@@ -103,17 +103,17 @@ sequenceDiagram
   `_dispatch` via `asyncio.run`, tags logs with the action, and maps results to envelopes:
   success → `200 {body}`, `BadRequest` → `400 {error}` (warned, no stacktrace), any other
   exception → `500 {error}` (logged with stacktrace).
-- **`create`.** `request_machines(template_id, count)` — `count` defaults to 1, `template_id`
+- **`create`.** `request_machines(template_id, count)` - `count` defaults to 1, `template_id`
   defaults to `RunInstances-OnDemand`. ORB records the request and launches instances; the call
-  returns before instances exist (eventually consistent — the next `status` sees them).
+  returns before instances exist (eventually consistent - the next `status` sees them).
 - **`status` has two shapes.** With a `request_id`, it calls `get_request_status([id])` directly
-  and returns — no reconcile, no machine list. Without one (the controller's path), it first runs
+  and returns - no reconcile, no machine list. Without one (the controller's path), it first runs
   `_reconcile_requests` then `list_machines`, filtering to live machines via `_live_machines`
   unless `include_terminated=true`.
 - **Reconcile is a read-through sync, and skips terminal requests.** `list_machines()` reads
   DynamoDB (a cache); machine status only advances when ORB reconciles a request against live EC2.
   So before listing, `_reconcile_requests` enumerates requests and calls `get_request_status` on
-  each — but **skips any request in `TERMINAL_REQUEST_STATES`** (complete/completed/failed/
+  each - but **skips any request in `TERMINAL_REQUEST_STATES`** (complete/completed/failed/
   cancelled), since a terminal request can't change and syncing it just costs a slow round-trip
   and makes ORB log `Cannot transition request from failed to complete`. Reconcile is best-effort
   and never raises: a `list_requests` failure falls back to stored state, and a per-request sync

@@ -1,4 +1,4 @@
-# HTC-Grid EC2 Worker Backend — Architecture & Operations
+# HTC-Grid EC2 Worker Backend - Architecture & Operations
 
 This document describes the **EC2 worker-plane backend** for HTC-Grid: an alternative to the
 default EKS backend in which the Agent+Lambda-RIE worker runs on plain EC2 instances under Docker
@@ -18,7 +18,7 @@ worker, the worker auto-computed and ran 2 pairs, 52 mock tasks finished (26 per
 A single Terraform root deploys either backend, chosen by one variable:
 
 ```hcl
-worker_backend = "eks"   # default — Helm/KEDA worker pods (unchanged)
+worker_backend = "eks"   # default - Helm/KEDA worker pods (unchanged)
 worker_backend = "ec2"   # EC2 + Docker Compose pairs, scaled by ORB
 ```
 
@@ -64,7 +64,7 @@ churning when upgrading to the selectable layout.
 
 ### Components (all new, under `worker_backend=ec2`)
 
-**`compute_plane_ec2/`** — defines the worker (not a running fleet):
+**`compute_plane_ec2/`** - defines the worker (not a running fleet):
 - IAM instance role + profile: attaches the control-plane `htc_agent_permissions_policy_arn`
   (same perms the EKS agent gets via IRSA) + `AmazonSSMManagedInstanceCore` +
   `AmazonEC2ContainerRegistryReadOnly` + an inline policy for SSM config read & worker-log writes.
@@ -78,17 +78,17 @@ churning when upgrading to the selectable layout.
   (`lambda:provided`, :8080) → `agent-i` with `network_mode`/`pid: service:rie-i`, unique
   `MY_POD_NAME=<instance-id>-pair-i`, and the `awslogs` driver.
 - **Per-container resource limits** (`cpus` + `mem_limit` on `rie-i`/`agent-i`) come from the
-  **same `agent_configuration` block the EKS backend uses** — there is ONE place to set them.
+  **same `agent_configuration` block the EKS backend uses** - there is ONE place to set them.
   The root reads `agent_configuration.{agent,lambda}.{maxCPU,maxMemory}` (defaults in
   `local.default_agent_configuration`) and passes them to **both** `htc_agent` (EKS, as chart
   requests/limits) and `compute_plane_ec2` (EC2, converted millicores→cores and MiB→`m`). So
   tuning the worker pair's CPU/memory is a single edit in `grid_config.json`'s
   `agent_configuration`, regardless of backend.
 
-**`orb_orchestrator/`** — the fleet orchestrator (ORB), ported from the proven CDK PoC:
+**`orb_orchestrator/`** - the fleet orchestrator (ORB), ported from the proven CDK PoC:
 - 3 DynamoDB state tables (`orb-<proj>-{machines,requests,templates}`, PK `id`:S, PITR, CMK).
 - **ZIP-packaged** Lambda (NOT a container image): built in the SAM build container like every
-  other htc-grid Lambda — `build.sh` stages `orb_lambda.py` + `config/`, `pip install`s
+  other htc-grid Lambda - `build.sh` stages `orb_lambda.py` + `config/`, `pip install`s
   `orb-py==1.6.2`, then applies the 4 mandatory DynamoDB-backend patches against the staged
   package before zipping. Runs on `python3.11`, outside any VPC, 512 MB / 300 s. No Dockerfile,
   no ECR repo, no image-build step.
@@ -98,12 +98,12 @@ churning when upgrading to the selectable layout.
   region + DynamoDB table prefix are read by **orb-py's own `ORB_AWS_*` env layer**
   (`AWSProviderConfig` is a pydantic-settings `BaseSettings`: `ORB_AWS_REGION`,
   `ORB_AWS_STORAGE__DYNAMODB__{TABLE_PREFIX,REGION}`), while the launch-template values that have
-  no `ORB_AWS_*` field — subnet, SG, instance profile, AMI, instance type, **and the worker
-  user_data fetched from SSM** — are substituted into `aws_templates.json` by the handler
+  no `ORB_AWS_*` field - subnet, SG, instance profile, AMI, instance type, **and the worker
+  user_data fetched from SSM** - are substituted into `aws_templates.json` by the handler
   (`orb_lambda._materialize_grid_config`). `ORB_ALLOW_TERMINATE_ALL` is unset (kill switch disabled).
 
-**`capacity_controller/`** — the scaling brain:
-- EventBridge `rate(1 minute)` → Lambda (outside VPC — it only calls regional AWS APIs: Lambda, SQS, DynamoDB, EC2/SSM).
+**`capacity_controller/`** - the scaling brain:
+- EventBridge `rate(1 minute)` → Lambda (outside VPC - it only calls regional AWS APIs: Lambda, SQS, DynamoDB, EC2/SSM).
 - Reads backlog directly from SQS (`get_queue_length` → `ApproximateNumberOfMessages`) + ORB **live** machine count, computes
   `desired = clamp(ceil(backlog / target_pending_per_instance), min, max)`, then invokes the
   orchestrator `create` (scale-up) or `terminate` oldest-first (scale-down).
@@ -147,7 +147,7 @@ TAG=<project>; REGION=eu-west-1
 make init-grid-state TAG=$TAG REGION=$REGION
 # 2. build/push the WORKER images for this project tag (ECR repos are account-wide):
 #    awshpc-lambda, lambda-init, submitter (+ shared lambda:provided), and lambda.zip.
-#    NOTE: the ORB orchestrator is NOT an image — it is zip-built by Terraform at apply time
+#    NOTE: the ORB orchestrator is NOT an image - it is zip-built by Terraform at apply time
 #    (orb_orchestrator/build.sh inside the SAM build container), so no image build is needed.
 make lambda lambda-init TAG=$TAG REGION=$REGION
 make -C examples/submissions/k8s_jobs build push TAG=$TAG REGION=$REGION
@@ -190,17 +190,17 @@ Knobs (in `ec2_worker_grid_config.json.tpl` / root variables): `ec2_instance_typ
    driving the table prefix + region through orb-py's own `ORB_AWS_*` env layer (so the bundled
    `config.json` ships grid-agnostic) and having the handler substitute the template-only values
    (subnet, SG, instance profile, AMI, instance type) into `aws_templates.json` at cold start.
-2. **Worker got no user-data** — ORB's `RunInstances` template had no `user_data`. Fixed by storing
+2. **Worker got no user-data** - ORB's `RunInstances` template had no `user_data`. Fixed by storing
    the rendered cloud-init in SSM and injecting it into the template `user_data` field at cold start.
 3. **Control-plane Lambdas crashed (502)** initializing the InfluxDB perf tracker. Fixed by passing
    `metrics_are_enabled = 0` to `control_plane` on the ec2 backend (not just the agent config).
-4. **node_drainer empty-`Resource` IAM error** — gated the node_drainer (EKS-only) off via an
+4. **node_drainer empty-`Resource` IAM error** - gated the node_drainer (EKS-only) off via an
    explicit `enable_node_drainer` flag.
-5. **capacity_controller hung (120 s timeout)** — it was VPC-attached but the VPC has no `lambda`
-   endpoint/NAT. Fixed by running the controller outside the VPC (it only calls regional AWS APIs —
+5. **capacity_controller hung (120 s timeout)** - it was VPC-attached but the VPC has no `lambda`
+   endpoint/NAT. Fixed by running the controller outside the VPC (it only calls regional AWS APIs -
    Lambda, SQS, DynamoDB, EC2/SSM).
    (At the time this also wedged a DynamoDB single-flight lock until its TTL; that lock was later
-   removed in favour of `reserved_concurrent_executions = 1` — ADR-001.)
+   removed in favour of `reserved_concurrent_executions = 1` - ADR-001.)
 6. **compose-plugin staging** `null_resource` didn't `mkdir` its cache dir. Fixed.
 
 ---
@@ -212,9 +212,9 @@ Knobs (in `ec2_worker_grid_config.json.tpl` / root variables): `ec2_instance_typ
   (the architecturev2 §B.4 blocking issue) are deferred.
 - **RunInstances on-demand only.** EC2 Fleet / Spot is a separate re-prove phase (ORB `machine_id`
   identity and async-fulfilment assumptions change).
-- **ORB launch-template leak** — ORB creates one LT per request and doesn't delete it; add a sweeper.
+- **ORB launch-template leak** - ORB creates one LT per request and doesn't delete it; add a sweeper.
 - **No Grafana/InfluxDB/Prometheus**; agent perf metrics off. Container logs go to CloudWatch.
-- **orb-py patches are pinned to 1.6.2**; the build fails loudly if an anchor moves — re-prove the
+- **orb-py patches are pinned to 1.6.2**; the build fails loudly if an anchor moves - re-prove the
   create/status/terminate loop on any version bump.
 - **Single-flight via `reserved_concurrent_executions = 1`** (ADR-001): an overlapping scheduled
   tick is throttled and async-retried (deferred re-run) rather than cleanly skipped. Harmless at
@@ -222,7 +222,7 @@ Knobs (in `ec2_worker_grid_config.json.tpl` / root variables): `ec2_instance_typ
 
 ---
 
-## 7. File structure — all changed (~) and new (+) files
+## 7. File structure - all changed (~) and new (+) files
 
 Legend: `+` new file/dir, `~` modified existing file.
 
@@ -241,7 +241,7 @@ htc-grid/
 │   │   ├── agent-config.tf                               ~ metrics_are_enabled_effective; ConfigMap count-gated to eks
 │   │   ├── .gitignore                                    ~ ignore .cache/ (compose-plugin staging) + agent_config.json
 │   │   │
-│   │   ├── control_plane/                                (shared, mostly untouched — one EKS-only gate)
+│   │   ├── control_plane/                                (shared, mostly untouched - one EKS-only gate)
 │   │   │   ├── main.tf                                   ~ add node_drainer_enabled local (gated on enable_node_drainer)
 │   │   │   ├── variables.tf                              ~ add enable_node_drainer; default eks_managed_node_groups={}
 │   │   │   ├── lambda_node_drainer.tf                    ~ count-gate node_drainer (fixes empty-Resource IAM error on ec2)
@@ -315,14 +315,14 @@ when it's needed. ORB is the EC2 analogue of KEDA+Cluster-Autoscaler, so it sits
 `compute_plane_ec2`.
 
 **Is `scaling_metrics` used on the ec2 backend?**
-No — it is **EKS-only** now (gated by `enable_scaling_metrics = worker_backend == "eks"`, the
+No - it is **EKS-only** now (gated by `enable_scaling_metrics = worker_backend == "eks"`, the
 same pattern as `node_drainer`). It is an EventBridge `rate(1 minute)` Lambda that reads the SQS
 backlog and `put_metric_data` publishes it as `pending_tasks_ddb` for KEDA to consume. The ec2
 `capacity_controller` reads the same `ApproximateNumberOfMessages` straight from SQS instead, so
 the CloudWatch republish hop (and that Lambda) is not deployed on ec2.
 
 **Why gate only `node_drainer`, not all of EKS?**
-All of EKS *is* gated — `compute_plane`/`htc_agent` are `count=0` on EC2. `node_drainer` is the one
+All of EKS *is* gated - `compute_plane`/`htc_agent` are `count=0` on EC2. `node_drainer` is the one
 EKS-only resource that lives inside the shared `control_plane` module, so it needs its own
 `enable_node_drainer` gate (its empty-`Resource` IAM policy would otherwise fail on EC2).
 
@@ -335,6 +335,6 @@ Consistency with every other htc-grid Lambda (no Dockerfile/ECR/image-build step
 the SAM build container; `build.sh` pip-installs `orb-py` and applies the 4 patches before zipping.
 
 **How do I size the worker pair's CPU/memory?**
-One place — `agent_configuration.{agent,lambda}.{maxCPU,maxMemory}` in `grid_config.json` — feeds
+One place - `agent_configuration.{agent,lambda}.{maxCPU,maxMemory}` in `grid_config.json` - feeds
 **both** backends (EKS chart limits and EC2 `cpus`/`mem_limit`). Separately, `ec2_pair_cpu`/
 `ec2_pair_memory` are the *packing budget* that decides `NUM_PAIRS` per instance.

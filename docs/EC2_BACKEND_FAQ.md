@@ -1,10 +1,10 @@
-# HTC-Grid EC2 Backend — Q&A
+# HTC-Grid EC2 Backend - Q&A
 
 A short FAQ for the **EC2 worker-plane backend** and its graceful scale-down. For the full
 picture see [`EC2_BACKEND_ARCHITECTURE.md`](./EC2_BACKEND_ARCHITECTURE.md), the decision log in
 [`architecture_design_decisions.md`](./architecture_design_decisions.md), and the sequence
 diagrams under [`diagrams/`](./diagrams) (up/down overview
-[`ec2-scaling-sequence.md`](./diagrams/ec2-scaling-sequence.md), drain detail
+[`ec2-scaling-up-sequence.md`](./diagrams/ec2-scaling-up-sequence.md), drain detail
 [`ec2-scaling-down-sequence.md`](./diagrams/ec2-scaling-down-sequence.md)).
 
 Answers cite `file:line` or the relevant ADR so they can be checked against the code.
@@ -21,7 +21,7 @@ Compose on plain EC2, scaled by ORB). The control plane and VPC are shared and u
 queue-watching capacity controller. See `EC2_BACKEND_ARCHITECTURE.md` §1.
 
 ### Q2. What problem does graceful scale-down solve?
-Surplus instances can't just be killed — a worker may be mid-task. Scale-down is task-aware: an
+Surplus instances can't just be killed - a worker may be mid-task. Scale-down is task-aware: an
 instance is only terminated once it has no in-flight work (or its drain deadline passes), so
 removing capacity does not abort running tasks. It is the EC2 analogue of draining a node before
 the Cluster Autoscaler removes it on EKS.
@@ -29,7 +29,7 @@ the Cluster Autoscaler removes it on EKS.
 ### Q3. How does "cordon then sweep then terminate" work, and why span multiple ticks?
 Cordon marks a surplus instance `draining` and tells its agents to stop claiming new work and
 finish the current task; a later tick's **sweep** terminates it once idle. The controller never
-blocks waiting for a drain — it cordons and returns, and re-derives the world next tick
+blocks waiting for a drain - it cordons and returns, and re-derives the world next tick
 (`ec2_capacity_controller.py:84` note "returns now, no blocking"). This keeps each invocation
 short and crash-safe.
 
@@ -39,13 +39,13 @@ short and crash-safe.
 
 ### Q4. How does the controller decide how many instances it wants?
 `desired = clamp(ceil(backlog / TARGET_PENDING_PER_INSTANCE), MIN_INSTANCES, MAX_INSTANCES)`,
-where `backlog` is read straight from the task queue — `queue_manager(...).get_queue_length()`
+where `backlog` is read straight from the task queue - `queue_manager(...).get_queue_length()`
 (SQS `ApproximateNumberOfMessages`, summed across priority queues), see
 `ec2_capacity_controller._read_backlog`. It then reconciles in three stages: sweep draining,
 scale up the remaining deficit, cordon any surplus.
 
 ### Q5. Which instances get drained first?
-Idle-first, then oldest — so the cheapest-to-remove instances go first
+Idle-first, then oldest - so the cheapest-to-remove instances go first
 (`_scale_down._victim_key`, `ec2_capacity_controller.py:204-212`).
 
 ### Q6. What actually happens to a worker when it's cordoned?
@@ -56,14 +56,14 @@ task, stops claiming, then exits. The compose `stop_grace_period` (1500s,
 `user-data.sh.tftpl:124,151`) bounds the wait. In a live test the **agent** containers logged
 `Received SIGTERM` ~64 ms after the stop began executing and drained within ~10 s; the **RIE**
 containers ignore SIGTERM, so `compose stop` rides out the full `stop_grace_period` and the SSM
-command stays `InProgress` until then. The controller does not wait on it — `send_command` is
+command stays `InProgress` until then. The controller does not wait on it - `send_command` is
 fire-and-forget and termination is gated on the worker going idle (Q10), not on the stop finishing.
 
 ---
 
 ## Busy detection & safety
 
-### Q7. How does the controller know an instance is busy — without a new table or index?
+### Q7. How does the controller know an instance is busy - without a new table or index?
 It reuses the existing task heartbeat. `query_live_tasks` queries the same `gsi_ttl_index` the
 `ttl_checker` uses, but for *live* tasks (`processing` AND `heartbeat_expiration_timestamp > now`)
 instead of expired ones (`state_table_dynamodb.py:217-254`). No new index, no new table, no agent
@@ -76,7 +76,7 @@ recover the instance id (`drain.busy_instance_ids`, `drain.py:163`).
 
 ### Q9. What if the state table is throttling and the controller can't tell who's busy?
 `busy_instance_ids` returns `None` (`drain.py:166-170`). On `None` the controller **skips
-scale-down** for that tick and leaves draining instances tagged — fail-safe is to keep capacity
+scale-down** for that tick and leaves draining instances tagged - fail-safe is to keep capacity
 rather than risk killing a busy worker (`ec2_capacity_controller.py:197-200`). This is the same
 throttling guard `ttl_checker` uses.
 
@@ -136,18 +136,18 @@ up to the size of the deficit before scale-up creates anything (`_sweep_draining
 `ec2_capacity_controller.py:126-130`; `drain.uncordon`, `drain.py:110-121`).
 
 ### Q18. Is SSM `compose stop` reliable?
-It's best-effort — SSM failures are logged, not raised (`_send_compose_command`,
+It's best-effort - SSM failures are logged, not raised (`_send_compose_command`,
 `drain.py:55-74`). The `drain_deadline` tag is the backstop that guarantees eventual termination
 even if a stop command never lands. Two things to know from live testing:
 
 - **SSM `Status` is not a trustworthy receipt.** During a scale-down test a cordon came back
-  `Undeliverable` on instances whose agents nonetheless logged `Received SIGTERM` ~1 s later — the
+  `Undeliverable` on instances whose agents nonetheless logged `Received SIGTERM` ~1 s later - the
   command ran but the acknowledgement was lost. AWS reports `Undeliverable` when it can't confirm
   delivery, which is *not* the same as "did not execute". This is exactly why the controller gates
-  terminate on the **effect** (worker went idle, Q10) rather than on the SSM status — an
+  terminate on the **effect** (worker went idle, Q10) rather than on the SSM status - an
   ack-loss false-negative can never wrongly kill a busy worker, and a truly-lost stop self-heals
   via the sweep's `resend_stop` (Q16).
-- **`Undeliverable` was not reproducible on a healthy idle worker** — a clean cordon delivered and
+- **`Undeliverable` was not reproducible on a healthy idle worker** - a clean cordon delivered and
   executed fine. The failure correlated with **rapid cordon/uncordon churn during scale events**
   (transient control-channel unavailability), not a missing VPC endpoint: the modern SSM agent
   (3.3.x) carries the whole RunCommand lifecycle over the `ssmmessages` (MGS) channel, and the
@@ -160,6 +160,6 @@ Environment / Terraform knobs: `MIN_INSTANCES`, `MAX_INSTANCES`, `TARGET_PENDING
 
 ### Q20. Why is `terminate {"all": true}` disabled by default in ORB?
 It's a fleet-wide kill switch that **bypasses** the graceful drain path, so it's gated behind
-`ORB_ALLOW_TERMINATE_ALL=1` and left unset in the HTC-Grid deployment — a stray invocation can't
+`ORB_ALLOW_TERMINATE_ALL=1` and left unset in the HTC-Grid deployment - a stray invocation can't
 wipe a live fleet mid-task. The scale-down path always passes explicit `machine_ids`
 (`orb_lambda.py:333-336`).

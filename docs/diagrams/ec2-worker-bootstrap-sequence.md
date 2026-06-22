@@ -7,7 +7,7 @@ agent long-polls the shared control plane. It is the EC2 analogue of a pod sched
 EKS node by KEDA + Cluster Autoscaler.
 
 The launch is driven by the scaling loop in
-[`ec2-scaling-sequence.md`](ec2-scaling-sequence.md); this doc zooms into a single instance.
+[`ec2-scaling-up-sequence.md`](ec2-scaling-up-sequence.md); this doc zooms into a single instance.
 Everything below is grounded in `compute_plane_ec2/user-data.sh.tftpl` and
 `compute_plane_ec2/launch_template.tf`.
 
@@ -84,15 +84,15 @@ sequenceDiagram
 | AMI | latest AL2023 (`data.aws_ssm_parameter.al2023_ami`) |
 | Instance type | `var.instance_type` (default `m6i.large`) |
 | IAM instance profile | `aws_iam_instance_profile.worker` (ECR pull, S3, SSM, CloudWatch Logs) |
-| Security group | `aws_security_group.worker` — no inbound; egress only |
+| Security group | `aws_security_group.worker` - no inbound; egress only |
 | Metadata | IMDSv2 required, `http_put_response_hop_limit = 3` (containers reach IMDS) |
 | Root volume | gp3, `var.instance_volume_size` |
 | User data | rendered `user-data.sh.tftpl` |
 
 ## What gets installed / created on the instance
 
-- **Packages:** `docker`; the compose CLI plugin staged from S3 (not from GitHub — private subnets have no egress to it).
-- **Dirs:** `/opt/htc/agent-config`, `/opt/htc/compose`, and one `/opt/htc/task-i` per pair (chmod 777 — getlayer/RIE run as uid 99 and must write `/var/task`).
+- **Packages:** `docker`; the compose CLI plugin staged from S3 (not from GitHub - private subnets have no egress to it).
+- **Dirs:** `/opt/htc/agent-config`, `/opt/htc/compose`, and one `/opt/htc/task-i` per pair (chmod 777 - getlayer/RIE run as uid 99 and must write `/var/task`).
 - **Config:** `Agent_config.tfvars.json` pulled from SSM SecureString; `.env` + `docker-compose.yml` rendered for `NUM_PAIRS`.
 - **Log file:** `/var/log/htc-bootstrap.log` (all user-data stdout/stderr via `tee`).
 
@@ -114,7 +114,7 @@ getlayer-i  --(service_completed_successfully)-->  rie-i  --(service_started)-->
 
 - **Auto `NUM_PAIRS`.** Override via `pairs_per_instance`; otherwise `min(floor(vCPU/PAIR_CPU), floor(memMB/PAIR_MEMORY))`, floored at 1, so each instance packs as many pairs as its size allows.
 - **No inbound; SSM-only.** The worker SG has no ingress; all control (including cordon `docker compose stop`, ADR-003) arrives via SSM RunShellScript.
-- **Ordering guarantees.** compose `depends_on` conditions make the layer land before the RIE starts and the RIE start before the agent — no race on `/var/task` or the local endpoint.
+- **Ordering guarantees.** compose `depends_on` conditions make the layer land before the RIE starts and the RIE start before the agent - no race on `/var/task` or the local endpoint.
 - **Logs.** Every container streams to CloudWatch under `INSTANCE_ID-pair-i-{getlayer,rie,agent}`, so a single instance's pairs are individually traceable.
 - **Graceful drain tie-in.** `stop_grace_period: 1500s` and the RIE `AWS_LAMBDA_GRACEFUL_TERMINATION_DELAY` give an in-flight task time to finish when the controller cordons the instance (see [`ec2-scaling-down-sequence.md`](ec2-scaling-down-sequence.md)).
 - **Live-verify.** `cat /var/log/htc-bootstrap.log` (expect `bootstrap complete`); `docker compose -p htc-workers ps` (expect getlayer Exited 0, rie + agent Up per pair).

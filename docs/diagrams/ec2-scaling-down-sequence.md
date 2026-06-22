@@ -1,4 +1,4 @@
-# HTC-Grid EC2 Backend — Graceful Scale-Down Sequence
+# HTC-Grid EC2 Backend - Graceful Scale-Down Sequence
 
 How `worker_backend = "ec2"` scales **down** without breaking running tasks (ADR-003, ADR-005).
 Scale-down is a two-phase **cordon then sweep then terminate** loop driven by the capacity
@@ -10,10 +10,10 @@ The drain is **provider-independent** (ADR-005): cordon, idle-detection, and dra
 **EC2-level functions owned by the controller** (SSM `compose stop`, the task heartbeat, EC2 tags),
 so they work no matter how capacity was provisioned. The controller asks **ORB** only to
 list / create / terminate; ORB owns the AWS API choice (RunInstances / EC2Fleet / ASG, possibly
-different per request). The "busy" signal is the **existing task heartbeat** — the same
+different per request). The "busy" signal is the **existing task heartbeat** - the same
 `gsi_ttl_index` the `ttl_checker` queries, but for live (not expired) tasks. No new index, no new
 table, no agent change. See `docs/architecture_design_decisions.md` and the up/down overview in
-[`ec2-scaling-sequence.md`](ec2-scaling-sequence.md).
+[`ec2-scaling-up-sequence.md`](ec2-scaling-up-sequence.md).
 
 ## Controller structure (two stages)
 
@@ -24,7 +24,7 @@ flowchart TB
     subgraph CTL["capacity_controller Lambda"]
         direction TB
         S1["Decide (every tick)<br/>read backlog (SQS GetQueueAttributes)<br/>read live count (orb_client.list_live) + drain tags (EC2)<br/>read busy set (heartbeat query, gsi_ttl_index)<br/>desired = clamp(ceil(backlog / target), min, max)"]
-        S2["Reconcile — 3 code stages, EC2-level drain is provider-independent<br/>stage 1 sweep: terminate idle/expired draining, reclaim on rebound, re-stop still-busy<br/>stage 2 scale-up: create the remaining deficit<br/>stage 3 scale-down: cordon surplus (SSM compose stop + write draining tags)"]
+        S2["Reconcile - 3 code stages, EC2-level drain is provider-independent<br/>stage 1 sweep: terminate idle/expired draining, reclaim on rebound, re-stop still-busy<br/>stage 2 scale-up: create the remaining deficit<br/>stage 3 scale-down: cordon surplus (SSM compose stop + write draining tags)"]
         S1 --> S2
     end
 
@@ -41,10 +41,10 @@ flowchart TB
 
 The drain core (the cordon in scale-down plus the sweep) is EC2-level and provider-agnostic: it
 cordons and waits for idle, then tells ORB to terminate the idle ids. ORB owns the **API choice** (RunInstances / EC2Fleet / ASG,
-possibly different per request) and decrements the right request on terminate — so the **graceful**
+possibly different per request) and decrements the right request on terminate - so the **graceful**
 logic is universal and only the **kill** is API-specific, handled inside ORB.
 
-## Cordon (a surplus tick — the controller drains directly)
+## Cordon (a surplus tick - the controller drains directly)
 
 ```mermaid
 sequenceDiagram
@@ -81,12 +81,12 @@ sequenceDiagram
         Note over CTL: victims = active minus desired, idle first then oldest
         CTL->>EC2: CreateTags lifecycle=draining, drain_deadline
         CTL->>SSM: SendCommand docker compose stop
-        SSM->>EC2: SIGTERM agents (caught ~64ms, drain in ~10s) — RIE ignores SIGTERM, rides stop_grace_period
-        Note over CTL: returns now, no blocking — send_command is fire-and-forget,<br/>terminate happens on a later tick gated on the worker going idle
+        SSM->>EC2: SIGTERM agents (caught ~64ms, drain in ~10s) - RIE ignores SIGTERM, rides stop_grace_period
+        Note over CTL: returns now, no blocking - send_command is fire-and-forget,<br/>terminate happens on a later tick gated on the worker going idle
     end
 ```
 
-## Sweep (a later tick — terminate drained, reclaim if backlog rebounds)
+## Sweep (a later tick - terminate drained, reclaim if backlog rebounds)
 
 ```mermaid
 sequenceDiagram
