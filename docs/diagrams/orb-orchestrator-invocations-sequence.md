@@ -104,7 +104,8 @@ sequenceDiagram
   success → `200 {body}`, `BadRequest` → `400 {error}` (warned, no stacktrace), any other
   exception → `500 {error}` (logged with stacktrace).
 - **`create`.** `request_machines(template_id, count)` - `count` defaults to 1, `template_id`
-  defaults to `EC2Fleet-Instant-ABIS`. For the EC2 Fleet templates (`TargetCapacityUnitType=vcpu`)
+  defaults to `EC2Fleet-Instant-OnDemand` (the ABIS template is rejected by orb-py's validator).
+  For the EC2 Fleet templates (`TargetCapacityUnitType=vcpu`)
   `count` is a **vCPU target**, not an instance count: ORB sets `TotalTargetCapacity=count` and AWS
   packs a mix of instances until their vCPUs meet it. ORB records the request and launches instances;
   the call returns before instances exist (eventually consistent - the next `status` sees them).

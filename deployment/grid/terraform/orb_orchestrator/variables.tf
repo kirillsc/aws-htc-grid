@@ -54,9 +54,9 @@ variable "worker_ami_id" {
 }
 
 variable "orb_template_id" {
-  description = "Which prebuilt template (from config/aws_templates.json) to grid-complete and use for worker launches"
+  description = "Which prebuilt template (from config/aws_templates.json) to grid-complete and use for worker launches. EC2Fleet-Instant-ABIS is currently unusable (orb-py's _validate_prerequisites rejects ABIS-only templates); use the enumerated EC2Fleet-Instant-OnDemand."
   type        = string
-  default     = "EC2Fleet-Instant-ABIS"
+  default     = "EC2Fleet-Instant-OnDemand"
 }
 
 variable "worker_user_data_plain" {

@@ -27,7 +27,7 @@ logger = Logger(service=os.environ.get("POWERTOOLS_SERVICE_NAME", "capacity_cont
 
 REGION = os.environ["REGION"]
 ORCHESTRATOR_FUNCTION = os.environ["ORCHESTRATOR_FUNCTION_NAME"]
-TEMPLATE_ID = os.environ.get("ORB_TEMPLATE_ID", "RunInstances-OnDemand")
+TEMPLATE_ID = os.environ.get("ORB_TEMPLATE_ID", "EC2Fleet-Instant-OnDemand")
 
 _lambda = boto3.client("lambda", region_name=REGION)
 

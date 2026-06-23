@@ -47,7 +47,7 @@ churning when upgrading to the selectable layout.
                                   │  single-flight via reserved concurrency = 1
                                   │  Lambda→Lambda Invoke
                                   ▼
-                       orb_orchestrator Lambda (zip: orb-py 1.6.2 + 4 patches, python3.11, outside VPC)
+                       orb_orchestrator Lambda (zip: orb-py 1.7.0, python3.11, outside VPC)
                                   │  create(vCPU target) / status / terminate   state → 3× DynamoDB (orb-<proj>-*) + CMK
                                   ▼  EC2 Fleet Instant, TargetCapacityUnitType=vcpu (template baked at deploy time; iam:PassRole worker role)
                        EC2 worker (AL2023, private subnet, instance profile, IMDSv2 hop=3)
@@ -88,9 +88,9 @@ churning when upgrading to the selectable layout.
 **`orb_orchestrator/`** - the fleet orchestrator (ORB), ported from the proven CDK PoC:
 - 3 DynamoDB state tables (`orb-<proj>-{machines,requests,templates}`, PK `id`:S, PITR, CMK).
 - **ZIP-packaged** Lambda (NOT a container image): built in the SAM build container like every
-  other htc-grid Lambda - `build.sh` stages `orb_lambda.py` + `config/`, `pip install`s
-  `orb-py==1.6.2`, then applies the 4 mandatory DynamoDB-backend patches against the staged
-  package before zipping. Runs on `python3.11`, outside any VPC, 512 MB / 300 s. No Dockerfile,
+  other htc-grid Lambda - the lambda module stages `orb_lambda.py` + the rendered `config/` and
+  `pip install`s `orb-py==1.7.0` (unmodified; its DynamoDB backend works out of the box, so there
+  is no patch step). Runs on `python3.11`, outside any VPC, 512 MB / 300 s. No Dockerfile,
   no ECR repo, no image-build step.
 - Least-privilege role: DDB RW on the 3 tables, EC2 launch-template + **CreateFleet/DescribeFleets/
   DeleteFleets/ModifyFleet** + run/terminate/describe + `DescribeInstanceTypes`, SSM AMI read, KMS,
@@ -156,7 +156,7 @@ make init-grid-state TAG=$TAG REGION=$REGION
 # 2. build/push the WORKER images for this project tag (ECR repos are account-wide):
 #    awshpc-lambda, lambda-init, submitter (+ shared lambda:provided), and lambda.zip.
 #    NOTE: the ORB orchestrator is NOT an image - it is zip-built by Terraform at apply time
-#    (orb_orchestrator/build.sh inside the SAM build container), so no image build is needed.
+#    (pip-installs orb-py inside the SAM build container), so no image build is needed.
 make lambda lambda-init TAG=$TAG REGION=$REGION
 make -C examples/submissions/k8s_jobs build push TAG=$TAG REGION=$REGION
 make -C examples/workloads/c++/mock_computation upload TAG=$TAG REGION=$REGION ACCOUNT_ID=<acct>
@@ -168,7 +168,8 @@ terraform apply -var-file=<repo>/generated/grid_config.json
 ```
 
 Knobs (in `ec2_worker_grid_config.json.tpl` / root variables): `orb_template_id`
-(default `EC2Fleet-Instant-ABIS`), `ec2_worker_vcpus`, `ec2_worker_memory_mb`,
+(default `EC2Fleet-Instant-OnDemand`; ABIS is currently blocked by an orb-py validator bug, see §6),
+`ec2_worker_vcpus`, `ec2_worker_memory_mb`,
 `orb_target_pending_per_pair`, `orb_min_vcpus`, `orb_max_vcpus`, `orb_max_instances`,
 `orb_control_interval`. Instance **types** come from the selected template (ABIS range or
 enumerated list), not a single `ec2_instance_type`. See the deployment guide for the full table.
@@ -181,10 +182,11 @@ enumerated list), not a single `ec2_instance_type`. See the deployment guide for
 
 ## 5. Validation performed (live, project `ec2t1`)
 
-> The live validation below ran with the ORB orchestrator packaged as a **container image**. It
-> has since been converted to a **zip Lambda** (build.sh + the SAM build container, python3.11);
-> the zip build + the 4 patches were re-proven locally on python3.11, but the live
-> create→status→terminate loop on the zip build has **not** yet been re-run end-to-end.
+> The live validation below ran with the ORB orchestrator packaged as a **container image** on
+> orb-py 1.6.2 (which required 4 cold-start DynamoDB patches). It has since been converted to a
+> **zip Lambda** (SAM build container, python3.11) on unmodified **orb-py 1.7.0** (DynamoDB fixes
+> upstreamed, no patches); the live create→status→terminate loop on this build should be re-run
+> end-to-end.
 
 | # | Test | Result |
 |---|---|---|
@@ -221,19 +223,24 @@ enumerated list), not a single `ec2_instance_type`. See the deployment guide for
   the live-task heartbeat. The `drain_deadline` backstop still force-terminates stragglers (re-queued
   by `ttl_checker`), so idempotent tasks are still assumed. The systemd `htc-workers` unit + async
   Step Functions drain remain deferred.
-- **EC2 Fleet Instant is the capacity API**, with capacity counted in vCPUs (ADR-006). Spot and
-  enumerated-type templates exist in the catalog but are **unproven end-to-end** - only the ABIS
-  on-demand path has been exercised on a live grid; re-prove `create→status→terminate→drain` before
-  relying on Spot.
+- **EC2 Fleet Instant is the capacity API**, with capacity counted in vCPUs (ADR-006). The default
+  is the **enumerated** `EC2Fleet-Instant-OnDemand` template (a `machine_types` list). The
+  `EC2Fleet-Instant-ABIS` template is **currently unusable**: orb-py's `_validate_prerequisites`
+  (`base_handler.py`) requires `machine_types`/`launch_template_id` and never consults
+  `abis_instance_requirements`, so an ABIS-only template is rejected at create
+  (`machine_types must be specified`) before the ABIS-capable Fleet builder runs - an upstream
+  orb-py bug. `EC2Fleet-Instant-Spot` exists but is unproven end-to-end; re-prove
+  `create→status→terminate→drain` before relying on Spot.
 - **`vcpus` may be missing from ORB status.** The vCPU-unit math relies on each machine reporting
   `vcpus`; some orb-py builds persist an empty `provider_data` (seen live on 1.6.2 for RunInstances
-  machines), which trips the controller's "1 worker per instance" fallback. Confirm the deployed
-  orb-py populates `provider_data.vcpus`, or have the controller resolve it via `DescribeInstanceTypes`.
+  machines), which trips the controller's "1 worker per instance" fallback. orb-py 1.7.0 still
+  derives `vcpus` via the same `derive_cpu_ram_from_instance_type` path, so confirm the deployed
+  1.7.0 build populates `provider_data.vcpus`, or have the controller resolve it via `DescribeInstanceTypes`.
 - **ORB launch-template leak** - ORB creates a launch template per fleet request and doesn't delete
   it; add a sweeper.
 - **No Grafana/InfluxDB/Prometheus**; agent perf metrics off. Container logs go to CloudWatch.
-- **orb-py patches are pinned to 1.6.2**; the build fails loudly if an anchor moves - re-prove the
-  create/status/terminate loop on any version bump.
+- **orb-py is pinned to 1.7.0** (unmodified - the DynamoDB fixes that 1.6.2 needed as 4 cold-start
+  patches are now upstream). Re-prove the create/status/terminate loop on any version bump.
 - **Single-flight via `reserved_concurrent_executions = 1`** (ADR-001): an overlapping scheduled
   tick is throttled and async-retried (deferred re-run) rather than cleanly skipped. Harmless at
   1/min with sub-300 s ticks; revisit if multiple invokers or near-timeout ticks appear.
@@ -290,13 +297,11 @@ htc-grid/
 ├── source/compute_plane/
 │   ├── orb_orchestrator/                                 + NEW: ORB orchestrator ZIP-build source (no Docker/ECR)
 │   │   ├── orb_lambda.py                                 + create/status/terminate dispatch (no cold-start substitution; asserts table prefix)
-│   │   ├── build.sh                                      + stage handler+config, pip-install orb-py, apply 4 patches → .build
-│   │   ├── requirements.txt                              + orb-py==1.6.2
-│   │   ├── .gitignore                                    + ignore .build/ (zip staging dir)
-│   │   ├── patches/apply_orb_patches.py                  + the 4 mandatory orb-py DynamoDB-backend fixes (target-dir aware, idempotent)
+│   │   ├── requirements.txt                              + orb-py==1.7.0 (unmodified; DynamoDB fixes upstream, no patches)
+│   │   ├── .gitignore                                    + ignore build artifacts (__pycache__, *.pyc)
+│   │   ├── test_orb_lambda.py                            + unit tests (status reconcile, table-prefix assert, shipped config invariants)
 │   │   ├── config/config.json                            + ORB storage(dynamodb)+provider config (grid-agnostic; region/table_prefix via ORB_AWS_* env)
-│   │   ├── config/aws_templates.json                     + prebuilt template catalog: EC2Fleet-Instant {ABIS, OnDemand, Spot} (vcpu unit)
-│   │   └── docs/ORB_DYNAMODB_{BUG_REPORT,PATCHES}.md      + diagnosis + condensed patch table
+│   │   └── config/aws_templates.json                     + prebuilt template catalog: EC2Fleet-Instant {ABIS, OnDemand, Spot} (vcpu unit)
 │   │
 │   └── python/lambda/capacity_controller/
 │       └── ec2_capacity_controller.py                    + controller logic: read backlog (SQS get_queue_length)+live, reconcile, invoke orchestrator
@@ -351,7 +356,7 @@ EKS managed-node-group's own Auto Scaling Group (what `node_drainer` hooks into)
 
 **Why is ORB a zip Lambda now instead of a container image?**
 Consistency with every other htc-grid Lambda (no Dockerfile/ECR/image-build step). It's built in
-the SAM build container; `build.sh` pip-installs `orb-py` and applies the 4 patches before zipping.
+the SAM build container, which pip-installs `orb-py` (unmodified) before zipping.
 
 **How do I size the worker pair's CPU/memory?**
 One place - `agent_configuration.{agent,lambda}.{maxCPU,maxMemory}` in `grid_config.json` - feeds

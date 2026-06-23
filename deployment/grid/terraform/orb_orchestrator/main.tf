@@ -7,8 +7,8 @@
 #   - 3 DynamoDB tables (machines/requests/templates) with the exact `id`:S schema ORB
 #     DescribeTable-checks and skips its own CreateTable;
 #   - a CMK encrypting them;
-#   - a ZIP-packaged Lambda (orb-py + 4 patches + handler + config), outside any VPC, built in
-#     the SAM build container (consistent with the other htc-grid Lambdas — no Docker image/ECR);
+#   - a ZIP-packaged Lambda (orb-py + handler + config), outside any VPC, built in the SAM build
+#     container (consistent with the other htc-grid Lambdas — no Docker image/ECR);
 #   - a least-privilege role: DDB RW on the 3 tables, EC2 launch-template + run/terminate/
 #     describe, SSM AMI read, KMS use, and iam:PassRole on the worker instance role.
 
@@ -73,13 +73,14 @@ resource "terraform_data" "template_guard" {
     precondition {
       # Keys here match the catalog JSON verbatim (jsondecode preserves them): the ABIS block is
       # "abisInstanceRequirements" with snake_case "vcpu_count"/"memory_mib" and "min"/"max".
-      condition = (
-        local.selected_tmpl == null ||
-        try(local.selected_tmpl.abisInstanceRequirements, null) == null ||
-        (
-          local.selected_tmpl.abisInstanceRequirements.vcpu_count.min >= var.pair_cpu &&
-          local.selected_tmpl.abisInstanceRequirements.memory_mib.min >= var.pair_memory
-        )
+      # ABIS-only floor check. Terraform does NOT reliably short-circuit ||, so a bare
+      # .abisInstanceRequirements.vcpu_count.min access throws "object has no attribute ..." on an
+      # enumerated (non-ABIS) template. Wrap the whole comparison in try(): when the ABIS block is
+      # absent the deep access fails and try() yields true (the floor check does not apply).
+      condition = try(
+        local.selected_tmpl.abisInstanceRequirements.vcpu_count.min >= var.pair_cpu &&
+        local.selected_tmpl.abisInstanceRequirements.memory_mib.min >= var.pair_memory,
+        true
       )
       error_message = "Selected ABIS template's vcpu_count.min must be >= pair_cpu and memory_mib.min >= pair_memory (else AWS could launch a box too small for one pair)."
     }
@@ -220,9 +221,9 @@ resource "local_file" "orb_config_json" {
 
 # --- The ZIP-packaged Lambda ----------------------------------------------------
 # Built in the SAM build container (build_in_docker), like the other htc-grid Lambdas.
-# The build: bundles orb_lambda.py + the staged config/, pip-installs orb-py into the package, then
-# runs the 4 mandatory orb-py DynamoDB-backend patches against the installed package before
-# zipping. ORB_CONFIG_DIR points at the bundled config; ORB_*_DIR writable dirs live in /tmp.
+# The build: bundles orb_lambda.py + the staged config/, then pip-installs orb-py into the package.
+# orb-py 1.7.0's DynamoDB backend works unmodified, so there is no patch step (it is installed as-is).
+# ORB_CONFIG_DIR points at the bundled config; ORB_*_DIR writable dirs live in /tmp.
 module "orb_orchestrator" {
   source  = "terraform-aws-modules/lambda/aws"
   version = "~> 5.0"
@@ -240,18 +241,16 @@ module "orb_orchestrator" {
   ]
 
   # Native pip build (runs INSIDE the SAM build container, so orb-py's native wheels match the
-  # Lambda runtime). The 4 mandatory orb-py DynamoDB patches are applied at COLD START by
-  # orb_lambda.py against the deployed /var/task package (idempotent string-replaces) — we do NOT
-  # patch at build time, because custom `commands` run on the HOST (not in docker) and would hang
-  # the host pip-install. The bundled config/ is the DEPLOY-TIME-RENDERED staging dir (grid-complete
-  # aws_templates.json + grid-agnostic config.json), bundled under orb-config/.
+  # Lambda runtime). orb-py 1.7.0 is installed unmodified — its DynamoDB backend works out of the
+  # box, so there is no build-time or cold-start patch step. The bundled config/ is the
+  # DEPLOY-TIME-RENDERED staging dir (grid-complete aws_templates.json + grid-agnostic
+  # config.json), bundled under orb-config/.
   source_path = [
     {
       path             = local.orb_source_dir
       pip_requirements = true # requirements.txt found in `path`
       patterns = [
         "orb_lambda.py",
-        "patches/.*",
         "!.*__pycache__.*",
         "!.*\\.pyc",
         "!\\.gitignore",

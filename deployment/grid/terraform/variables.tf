@@ -83,10 +83,14 @@ variable "orb_control_interval" {
 # source/compute_plane/orb_orchestrator/config/aws_templates.json; every template is an EC2 Fleet
 # (instant) with TargetCapacityUnitType=vcpu, differing only in instance selection (ABIS / enumerated
 # / spot). Terraform grid-completes the selected one (subnet/SG/profile/AMI/user_data) and bakes it.
+# Default is the enumerated EC2Fleet-Instant-OnDemand: orb-py's _validate_prerequisites
+# (base_handler.py) rejects ABIS-only templates ("machine_types must be specified") because it never
+# consults abis_instance_requirements, so EC2Fleet-Instant-ABIS cannot create until that upstream
+# validator is fixed. The enumerated template carries machine_types and passes.
 variable "orb_template_id" {
-  description = "Prebuilt ORB template id to use for worker launches (ec2 backend); see config/aws_templates.json."
+  description = "Prebuilt ORB template id to use for worker launches (ec2 backend); see config/aws_templates.json. EC2Fleet-Instant-ABIS is currently unusable (orb-py validator rejects ABIS-only templates)."
   type        = string
-  default     = "EC2Fleet-Instant-ABIS"
+  default     = "EC2Fleet-Instant-OnDemand"
 }
 
 variable "ec2_drain_deadline_sec" {

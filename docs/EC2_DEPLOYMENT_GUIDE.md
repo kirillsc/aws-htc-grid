@@ -122,7 +122,7 @@ Defaults come from `examples/configurations/Makefile`; override by editing
 
 | Key | Default | Meaning |
 |---|---|---|
-| `orb_template_id` | `EC2Fleet-Instant-ABIS` | Which prebuilt ORB template to use (see `config/aws_templates.json`): `EC2Fleet-Instant-ABIS` (AWS picks any type in a vCPU/mem range), `EC2Fleet-Instant-OnDemand` (enumerated types), `EC2Fleet-Instant-Spot` |
+| `orb_template_id` | `EC2Fleet-Instant-OnDemand` | Which prebuilt ORB template to use (see `config/aws_templates.json`): `EC2Fleet-Instant-OnDemand` (enumerated types - the default), `EC2Fleet-Instant-Spot` (enumerated spot), `EC2Fleet-Instant-ABIS` (AWS picks any type in a vCPU/mem range - **currently unusable**: orb-py's validator rejects ABIS-only templates, see §8) |
 | `ec2_worker_vcpus` | `1` | vCPUs per worker pair; sizes `NUM_PAIRS` at boot and converts pairs↔vCPUs in the controller |
 | `ec2_worker_memory_mb` | `2048` | MiB per worker pair (the other half of the boot-time auto-pack) |
 | `orb_target_pending_per_pair` | `4` | Backlog target per worker pair: `desired_pairs = ceil(backlog / this)` |
@@ -163,5 +163,6 @@ Or use the failure-tolerant teardown script:
 | `config-ec2` produced an EKS config | You ran `happy-path`/`upload-c++` after it → re-run `config-ec2` last |
 | Apply fails on `RepositoryAlreadyExistsException` | ECR repos are region-global; don't run `transfer-images` if they exist - build only worker images |
 | No workers ever launch | Backlog below threshold, or `orb_max_vcpus=0`; check capacity controller logs |
-| Controller logs `no vcpu or memory data ... defaulting to 1 worker per instance` (ERROR) | ORB status returned no `vcpus` for a machine, so vCPU-accurate sizing degraded to 1 worker/instance; confirm the deployed orb-py populates `provider_data.vcpus` |
+| ORB request fails: `Template validation failed - instanceType: machine_types must be specified` | `orb_template_id` is set to `EC2Fleet-Instant-ABIS`. orb-py's `_validate_prerequisites` (`base_handler.py`) requires `machine_types`/`launch_template_id` and never consults `abis_instance_requirements`, so an ABIS-only template is rejected before the (ABIS-capable) Fleet builder runs - an upstream orb-py bug. Use the enumerated `EC2Fleet-Instant-OnDemand` (the default) until it is fixed |
+| Controller logs `no vcpu or memory data ... defaulting to 1 worker per instance` (ERROR) | ORB status returned no `vcpus` for a machine, so vCPU-accurate sizing degraded to 1 worker/instance; confirm the deployed orb-py 1.7.0 populates `provider_data.vcpus` (1.6.2 left it empty for RunInstances machines) |
 | Worker can't reach Redis/SQS | Worker SG is egress-only; confirm it's in the control-plane VPC/subnets |

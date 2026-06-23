@@ -57,8 +57,9 @@ having to understand it.
   is closed.
 - **`vcpus` must actually be present in ORB status.** Verified live on a real grid: deployed orb-py
   1.6.2 returned an EMPTY `provider_data` for RunInstances machines, so the controller fell back to
-  1-worker-per-instance every tick. The fleet path / a fixed orb-py build needs to populate it, else
-  the vCPU benefit is lost (the fallback keeps things running, loudly). See `orb-status-exposes-vcpus`.
+  1-worker-per-instance every tick. orb-py 1.7.0 (now pinned) still derives `vcpus` via the same
+  path; confirm the fleet path populates it on 1.7.0, else the vCPU benefit is lost (the fallback
+  keeps things running, loudly). See `orb-status-exposes-vcpus`.
 - A single Fleet uses one shared launch template, so a fixed `pairs_per_instance` override can't be
   applied per type - pairs are always auto-packed from real capacity (this is why the override knob
   was removed).
@@ -313,11 +314,11 @@ at least once (`status`), plus `create`/`terminate` when scaling.
 
 **Why separate.**
 - **Cold-start weight.** The orchestrator pulls orb-py + its tree (pydantic, cryptography,
-  sqlalchemy, boto3) and on every cold start runs `_patch_orb_at_cold_start()` (copy orb → /tmp,
-  apply 4 patches, build a fresh ORB SDK client = seconds). The controller is boto3-only and
-  fires every minute. Merging would put that heavy ORB init on the high-frequency metric path
-  even on no-op/status-only ticks. (ORB doc B.2: keep the actuator a separate Lambda; do not
-  fold ORB init into the high-frequency metric path; keep each invocation single-purpose.)
+  sqlalchemy, boto3) and on every cold start builds a fresh ORB SDK client (seconds). The
+  controller is boto3-only and fires every minute. Merging would put that heavy ORB init on the
+  high-frequency metric path even on no-op/status-only ticks. (ORB doc B.2: keep the actuator a
+  separate Lambda; do not fold ORB init into the high-frequency metric path; keep each invocation
+  single-purpose.)
 - **Roles / reuse.** Controller = decider, orchestrator = actuator (mirrors KEDA vs autoscaler
   on EKS). The orchestrator can be invoked by other callers (manual ops, future controllers),
   not just this one.
@@ -335,8 +336,8 @@ at least once (`status`), plus `create`/`terminate` when scaling.
   invoke). Accepted. If it becomes material, the mitigation is **provisioned concurrency on
   `orb_orchestrator`** (keep ORB warm), not merging.
 
-**Revisit if:** ORB initialization becomes cheap (e.g. patches upstreamed, lighter client), or
-the per-tick invoke latency/cost is shown to matter and provisioned concurrency is insufficient.
+**Revisit if:** ORB initialization becomes cheap (e.g. a lighter client), or the per-tick invoke
+latency/cost is shown to matter and provisioned concurrency is insufficient.
 
 ---
 

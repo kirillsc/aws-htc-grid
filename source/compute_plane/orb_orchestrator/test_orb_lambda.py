@@ -5,9 +5,8 @@
 """Unit tests for the ORB orchestrator Lambda's status reconcile path.
 
 Runnable with plain stdlib (no pytest): `python3 -m unittest test_orb_lambda`.
-The handler imports boto3 / aws_lambda_powertools at module load and `orb` lazily inside
-_dispatch; none are installed in dev, so we stub them in sys.modules before importing and
-set ORB_SKIP_RUNTIME_PATCH=1 so the cold-start patch step is a no-op.
+The handler imports aws_lambda_powertools at module load and `orb` lazily inside _dispatch;
+neither is installed in dev, so we stub them in sys.modules before importing.
 """
 
 from __future__ import annotations
@@ -21,10 +20,7 @@ from unittest import mock
 
 
 def _install_stub_modules() -> None:
-    """Stub the AWS deps the handler imports at module load so it can import in dev."""
-    if "boto3" not in sys.modules:
-        sys.modules["boto3"] = mock.MagicMock(name="boto3")
-
+    """Stub the deps the handler imports at module load so it can import in dev."""
     if "aws_lambda_powertools" not in sys.modules:
         powertools = types.ModuleType("aws_lambda_powertools")
 
@@ -56,8 +52,7 @@ def _install_stub_modules() -> None:
         sys.modules["aws_lambda_powertools"] = powertools
 
 
-os.environ["ORB_SKIP_RUNTIME_PATCH"] = "1"
-os.environ.pop("ORB_CONFIG_DIR", None)  # skip _materialize_grid_config at import
+os.environ.pop("ORB_CONFIG_DIR", None)  # skip the _assert_grid_config table-prefix check at import
 _install_stub_modules()
 
 # Import the module under test after the stubs are in place.

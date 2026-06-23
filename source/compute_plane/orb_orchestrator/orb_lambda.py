@@ -2,7 +2,7 @@
 
 Invoked synchronously (e.g. `aws lambda invoke`) with an event of the shape:
 
-    {"action": "create",    "template_id": "RunInstances-OnDemand", "count": 1}
+    {"action": "create",    "template_id": "EC2Fleet-Instant-OnDemand", "count": 1}
     {"action": "status",    "request_id": "req-..."}     # request-scoped
     {"action": "status"}                                  # live managed machines
     {"action": "status",    "include_terminated": true}  # full history
@@ -31,48 +31,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
-import subprocess
-import sys
 from typing import Any
 
-import boto3
 from aws_lambda_powertools import Logger
 
 logger = Logger(service=os.environ.get("POWERTOOLS_SERVICE_NAME", "orb_orchestrator"))
 
-
-def _patch_orb_at_cold_start() -> None:
-    """Apply the 4 mandatory orb-py DynamoDB-backend patches at cold start.
-
-    orb-py is installed unmodified by `pip_requirements` (so its native wheels match the
-    runtime). We cannot patch /var/task (read-only in Lambda), so copy the installed `orb`
-    package to a writable /tmp dir, patch that copy, and prepend it to sys.path BEFORE any
-    `import orb`. Idempotent (the patch script skips already-applied edits) and fast (string
-    replaces), so the per-cold-start cost is negligible.
-    """
-    if os.environ.get("ORB_SKIP_RUNTIME_PATCH") == "1":
-        return
-    import importlib.util
-
-    spec = importlib.util.find_spec("orb")
-    if spec is None or not spec.submodule_search_locations:
-        logger.warning("orb package not found; cannot apply runtime patches")
-        return
-    installed_orb = spec.submodule_search_locations[0]  # .../orb
-    dst_root = "/tmp/orb-patched"
-    dst_orb = os.path.join(dst_root, "orb")
-    if not os.path.isdir(dst_orb):
-        os.makedirs(dst_root, exist_ok=True)
-        shutil.copytree(installed_orb, dst_orb)
-        patch_script = os.path.join(os.environ["LAMBDA_TASK_ROOT"], "patches", "apply_orb_patches.py")
-        subprocess.run([sys.executable, patch_script, dst_root], check=True)
-    # Ensure the patched copy wins over the /var/task site-packages one.
-    if dst_root not in sys.path:
-        sys.path.insert(0, dst_root)
-
-
-_patch_orb_at_cold_start()
+# orb-py is installed unmodified by `pip_requirements` (its native wheels match the runtime).
+# As of orb-py 1.7.0 the DynamoDB storage backend works out of the box, so there is no
+# cold-start monkey-patch step anymore (earlier builds copied orb -> /tmp and applied 4
+# DynamoDB fixes; those are now upstream).
 
 # Machine statuses that count as live capacity. ORB persists terminated machines
 # in its state table, so anything outside this set is historical and must not be
@@ -221,7 +189,7 @@ async def _dispatch(event: dict[str, Any]) -> dict[str, Any]:
         # WARNING; re-raise them here if ORB_DEBUG_AWS=1 so raw wire logs reach CloudWatch.
         _enable_aws_wire_logs()
         if action == "create":
-            template_id = event.get("template_id", "RunInstances-OnDemand")
+            template_id = event.get("template_id", "EC2Fleet-Instant-OnDemand")
             count = int(event.get("count", 1))
             result = await client.request_machines(
                 template_id=template_id, count=count

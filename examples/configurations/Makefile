@@ -20,7 +20,7 @@ ORB_TARGET_PENDING_PER_PAIR?=4
 ORB_MIN_VCPUS?=0
 ORB_MAX_VCPUS?=64
 ORB_CONTROL_INTERVAL?=60
-ORB_TEMPLATE_ID?=EC2Fleet-Instant-ABIS
+ORB_TEMPLATE_ID?=EC2Fleet-Instant-OnDemand
 
 
 generated-c++: grid_config.json.tpl

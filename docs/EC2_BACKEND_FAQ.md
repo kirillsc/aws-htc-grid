@@ -55,7 +55,8 @@ default scheduler also surfaces it top-level, so the controller just sums it (no
 call, no extra IAM). `_vcpus_of` falls back in order: real `vcpus` → size by `memory_mib` →, if
 NEITHER is present, log an **ERROR** and default to 1 worker per instance (`PAIR_CPU` vCPUs). The
 fallback keeps the controller running but loses vCPU-accurate sizing, so it is surfaced loudly. (Seen
-live: some orb-py builds persist an empty `provider_data`, which trips this fallback.)
+live on orb-py 1.6.2: some builds persist an empty `provider_data`, which trips this fallback; 1.7.0
+is now pinned, so confirm it populates `provider_data.vcpus` on the deployed build.)
 
 ### Q5. Which instances get drained first?
 Idle-first, then oldest - so the cheapest-to-remove instances go first

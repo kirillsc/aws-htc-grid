@@ -85,7 +85,7 @@ sequenceDiagram
         end
         Note over CTL: Stage 2 - create the vCPU deficit that remains after reclaim
         opt deficit still > 0
-            CTL->>ORB: invoke {"action":"create","template_id":"EC2Fleet-Instant-ABIS","count":Δvcpus}
+            CTL->>ORB: invoke {"action":"create","template_id":"EC2Fleet-Instant-OnDemand","count":Δvcpus}
             ORB->>DDB: record request
             ORB->>EC2: CreateFleet (TargetCapacityUnitType=vcpu; ABIS or enumerated types)
             Note over EC2: cloud-init: SSM config → ECR login →<br/>NUM_PAIRS = min(vCPU/pair_cpu, mem/pair_mem) →<br/>docker compose up -d (N agent+RIE pairs)
@@ -135,7 +135,8 @@ sequenceDiagram
   + SSM `compose stop`/`start`). ORB is invoked only for capacity bookkeeping -
   `status` / `create` / `terminate` (`orb_client.py`). ORB owns the AWS API choice
   (it builds an EC2 Fleet per request from the selected template).
-- **Template selection.** `create` names a prebuilt template (default `EC2Fleet-Instant-ABIS`); the
-  catalog (`config/aws_templates.json`) is grid-completed + baked at deploy time. The controller
-  treats every template identically (it only sends a vCPU count), so ABIS vs enumerated is invisible
-  to it. See ADR-006.
+- **Template selection.** `create` names a prebuilt template (default `EC2Fleet-Instant-OnDemand`,
+  an enumerated `machine_types` list); the catalog (`config/aws_templates.json`) is grid-completed +
+  baked at deploy time. The controller treats every template identically (it only sends a vCPU
+  count), so ABIS vs enumerated is invisible to it. See ADR-006. (`EC2Fleet-Instant-ABIS` is in the
+  catalog but currently rejected by orb-py's validator - see the architecture doc §6.)
